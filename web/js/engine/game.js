@@ -15,7 +15,7 @@ import { audio } from './audio.js';
 import { Camera } from './camera.js';
 import {
   FIXED_STEP, FX, HAZARD, LANE_X, MAX_FRAME_TIME, POWER, POWER_DEFS,
-  SCORE, SPEED,
+  SCORE, SPEED, STORAGE_KEYS,
 } from './constants.js';
 import { ACTION, input } from './input.js';
 import { ParticleSystem } from './particles.js';
@@ -23,7 +23,8 @@ import { Player } from './player.js';
 import { Renderer } from './renderer.js';
 import { World } from './world.js';
 import {
-  boxesOverlap, clamp, clamp01, makeRng, prefersReducedMotion, remap, vibrate,
+  boxesOverlap, clamp, clamp01, makeRng, prefersReducedMotion, remap, storage,
+  vibrate,
 } from './util.js';
 
 /** High-level game states. */
@@ -69,6 +70,17 @@ export class Game {
       hoverboards: 0,
     };
 
+    /**
+     * Consumable stock that survives death and page reloads.
+     *
+     * Kept separate from `stats` because `stats` is rebuilt from the profile
+     * by `applyUpgrades()` on every run: writing a spent hoverboard back into
+     * it would simply be overwritten, which is exactly how the count used to
+     * respawn. This object is the run-time authority and is mirrored to
+     * localStorage the instant anything is spent.
+     */
+    this.inventory = this._loadInventory();
+
     /** Populated by `_buildHud()` each frame and read by React. */
     this.hud = {};
 
@@ -110,7 +122,14 @@ export class Game {
     window.removeEventListener('orientationchange', this._onResize);
   }
 
-  /** Apply shop upgrades to the derived stat block. */
+  /**
+   * Apply shop upgrades to the derived stat block.
+   *
+   * Note that `stats.hoverboards` is populated here (the catalog effect maps to
+   * that name) but is deliberately NOT the stock the run uses - see
+   * `this.inventory`. Reading stock from here is what let a spent board come
+   * back, because this block is rebuilt from the profile on every run.
+   */
   applyUpgrades(upgrades = {}, catalog = []) {
     // Start from the defaults, then layer each purchased tier.
     this.stats.magnetSeconds = POWER_DEFS[POWER.MAGNET].duration;
@@ -135,6 +154,40 @@ export class Game {
 
   setSkin(skin) {
     this.player.skin = skin;
+  }
+
+  // =========================================================================
+  // Consumable inventory
+  // =========================================================================
+
+  /** Read the persisted stock. Never throws - storage is already defensive. */
+  _loadInventory() {
+    const stored = storage.get(STORAGE_KEYS.inventory, null);
+    const hoverboard = stored && Number.isFinite(stored.hoverboard)
+      ? Math.max(0, Math.floor(stored.hoverboard))
+      : 0;
+    return { hoverboard };
+  }
+
+  /** Mirror the stock to localStorage immediately after any change. */
+  _saveInventory() {
+    storage.set(STORAGE_KEYS.inventory, this.inventory);
+  }
+
+  /**
+   * Overwrite the stock from the owning profile.
+   *
+   * The profile (server or localStorage mirror) is authoritative between runs,
+   * so syncing here both migrates players who have no inventory key yet and
+   * repairs any drift caused by a run that ended without the UI committing the
+   * spend. Called once per run start, never mid-run.
+   */
+  syncInventory(counts = {}) {
+    const owned = counts.hoverboard;
+    this.inventory.hoverboard = Number.isFinite(owned)
+      ? Math.max(0, Math.floor(owned))
+      : 0;
+    this._saveInventory();
   }
 
   // =========================================================================
@@ -199,7 +252,13 @@ export class Game {
     this.score = Math.floor(headStart * SCORE.perMetre);
 
     this.player.reset(headStart, skin);
-    this.hoverboardsLeft = Math.floor(this.stats.hoverboards || 0);
+
+    // Stock is taken from the persisted inventory, NOT from `stats.hoverboards`
+    // (which `applyUpgrades()` rebuilds from the profile every run and would
+    // therefore hand back a board that was already spent). `syncInventory()`
+    // reconciles the two before we get here.
+    this.hoverboardsLeft = Math.floor(this.inventory.hoverboard || 0);
+    this.player.hoverboards = this.hoverboardsLeft;
     this.particles.clear();
     this.camera.snapTo(this.player);
 
@@ -576,6 +635,8 @@ export class Game {
 
   /** A fatal (or shield-absorbed) impact. */
   _impact(hazard) {
+    this.player.flashHit();
+
     // Shield absorbs the hit and is consumed.
     if (this.powers.shield > 0) {
       this.powers.shield = 0;
@@ -589,9 +650,14 @@ export class Game {
       return;
     }
 
-    // Hoverboard save.
-    if (this.hoverboardsLeft > 0) {
-      this.hoverboardsLeft--;
+    // Hoverboard save. The player owns the count, so an empty stock makes this
+    // fall through to a real death.
+    if (this.player.consumeHoverboard()) {
+      this.hoverboardsLeft = this.player.hoverboards;
+      // Persist before anything else: a board spent is spent, even if the tab
+      // is closed during the revive animation.
+      this.inventory.hoverboard = this.hoverboardsLeft;
+      this._saveInventory();
       this.player.revive();
       this.particles.powerBurst(this.player.x, this.player.centerY, this.player.z, '#22e8ff');
       this.camera.addShake(9);
@@ -609,6 +675,8 @@ export class Game {
     if (this.player.dead) return;
 
     this.player.dead = true;
+    this.player.deathTime = 0;
+    this.player.flashHit();
     this.deathCause = cause;
     this.deathTimer = DEATH_DURATION;
     this.state = STATE.DYING;
@@ -819,6 +887,11 @@ export class Game {
       hitFlash: this.hitFlash,
       pickupFlash: this.pickupFlash,
       reducedMotion: this.reducedMotion,
+      hoverboards: this.hoverboardsLeft,
+      playing: this.state === STATE.PLAYING || this.state === STATE.COUNTDOWN,
+      // Test hook only: lets the animation harness render a character-free
+      // plate to diff against. Never set during normal play.
+      hidePlayer: !!this.__hidePlayer,
     };
   }
 

@@ -446,6 +446,34 @@ export class ApiClient {
     return this._localProfile();
   }
 
+  /**
+   * Set a consumable to an exact remaining count.
+   *
+   * Preferred over `consume` when the caller already knows the post-spend
+   * total: assigning is idempotent, so a duplicated event cannot burn a second
+   * item. The local mirror is written synchronously before the request so the
+   * spend survives an immediate reload; the server is then told the delta,
+   * since its endpoint is decrement-based.
+   */
+  async setConsumable(itemId, remaining) {
+    const left = Math.max(0, Math.floor(remaining));
+    let delta = 0;
+
+    this._saveLocal((profile) => {
+      const owned = profile.upgrades[itemId] || 0;
+      delta = Math.max(0, owned - left);
+      profile.upgrades[itemId] = left;
+    });
+
+    if (delta > 0) {
+      const response = await this._request('/api/shop/consume', {
+        method: 'POST', body: { itemId, count: delta },
+      });
+      if (response && response.ok && response.player) this._cacheProfile(response.player);
+    }
+    return this._localProfile();
+  }
+
   /** Persist the opaque progress blob (missions, tutorial flags). */
   async saveProgress(progress) {
     this._saveLocal((profile) => { profile.progress = progress; });

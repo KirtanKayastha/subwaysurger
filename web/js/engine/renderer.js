@@ -831,7 +831,14 @@ export class Renderer {
     const player = state.player;
     const palette = player.palette;
 
-    const p = cam.project(player.x, player.y, player.z);
+    // Test hook: render the scene without the character so the animation
+    // harness can isolate the body by differencing two frames.
+    if (state.hidePlayer) return;
+
+    // projectNew (not project) because `project` returns a shared scratch
+    // object: every later call would clobber this one, and the body would be
+    // drawn at the shadow's position.
+    const p = cam.projectNew(player.x, player.y, player.z);
     if (!p.visible) return;
 
     const scale = p.scale;
@@ -843,7 +850,7 @@ export class Renderer {
     // Anchored to the ground beneath the runner, shrinking as they rise, which
     // is the main visual cue for jump height.
     const groundY = Number.isFinite(player.groundY) ? player.groundY : 0;
-    const shadow = cam.project(player.x, groundY + 0.01, player.z);
+    const shadow = cam.projectNew(player.x, groundY + 0.01, player.z);
     if (shadow.visible) {
       const lift = clamp01((player.y - groundY) / 2.6);
       const sr = unit * 0.5 * (1 - lift * 0.45);
@@ -919,166 +926,413 @@ export class Renderer {
     if (pose === POSE.SLIDE) {
       this._drawPlayerSliding(ctx, unit, palette, player);
     } else if (pose === POSE.CRASH) {
-      this._drawPlayerCrashed(ctx, unit, palette, state.time);
+      this._drawPlayerCrashed(ctx, unit, palette, player);
     } else {
-      this._drawPlayerUpright(ctx, unit, palette, player, pose, bob);
+      this._drawPlayerUpright(ctx, unit, palette, player, pose, bob,
+                              cam, p, lean, 1, 1);
     }
 
     ctx.restore();
     ctx.globalAlpha = 1;
   }
 
-  _drawPlayerUpright(ctx, unit, palette, player, pose, bob) {
-    const stride = player.stride;
-    const airborne = pose === POSE.JUMP || pose === POSE.FALL;
+  // =========================================================================
+  // Character rig
+  // =========================================================================
+  //
+  // The runner is drawn procedurally from trig curves rather than sprite
+  // sheets, so every pose blends continuously and scales to any resolution.
+  //
+  // Conventions inside the rig: origin is at the feet, -y is up, and `u` is
+  // pixels-per-metre. Limbs are two-segment (hip->knee->foot) so they bend
+  // like real joints instead of pivoting as rigid sticks.
 
-    const hipY = -unit * 0.86 - bob;
-    const shoulderY = -unit * 1.5 - bob;
-    const headY = -unit * 1.66 - bob;
+  /**
+   * Draw a two-segment limb and return the end-effector position.
+   *
+   * `a1` swings the upper segment, `a2` bends the lower one relative to it.
+   * Angles are radians, measured from straight-down.
+   */
+  _limb(ctx, x, y, len1, len2, a1, a2, w, color) {
+    const kx = x + Math.sin(a1) * len1;
+    const ky = y + Math.cos(a1) * len1;
+    const fx = kx + Math.sin(a1 + a2) * len2;
+    const fy = ky + Math.cos(a1 + a2) * len2;
 
-    const limb = Math.max(1.2, unit * 0.1);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = w;
     ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(kx, ky);
+    ctx.lineTo(fx, fy);
+    ctx.stroke();
 
-    // Legs
-    ctx.strokeStyle = palette.secondary;
-    ctx.lineWidth = limb;
-    if (airborne) {
-      // Tucked in the air.
+    return { kx, ky, fx, fy };
+  }
+
+  /**
+   * Head, drawn for a REAR view: the camera is behind the runner, so we see
+   * the back of the skull and hair - never a face or a side-on visor.
+   * `turn` shifts a sliver of visor into view when the runner leans.
+   */
+  _head(ctx, x, y, r, palette, turn = 0) {
+    ctx.save();
+    ctx.translate(x, y);
+
+    // Skull.
+    ctx.fillStyle = '#f3e2d0';
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, TAU);
+    ctx.fill();
+
+    // Hair covering the back of the head, which is most of what we see.
+    ctx.fillStyle = palette.secondary;
+    ctx.beginPath();
+    ctx.arc(0, -r * 0.12, r * 0.94, Math.PI * 0.08, Math.PI * 0.92, false);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(0, -r * 0.42, r * 0.86, r * 0.6, 0, 0, TAU);
+    ctx.fill();
+
+    // Headphone band + cups: reads instantly at small sizes and gives the
+    // silhouette a recognisable shape from behind.
+    ctx.strokeStyle = palette.primary;
+    ctx.lineWidth = Math.max(1, r * 0.16);
+    ctx.beginPath();
+    ctx.arc(0, -r * 0.05, r * 0.9, Math.PI * 1.12, Math.PI * 1.88);
+    ctx.stroke();
+    ctx.fillStyle = palette.primary;
+    for (const side of [-1, 1]) {
       ctx.beginPath();
-      ctx.moveTo(0, hipY);
-      ctx.lineTo(-unit * 0.2, hipY + unit * 0.42);
-      ctx.lineTo(-unit * 0.06, hipY + unit * 0.78);
-      ctx.moveTo(0, hipY);
-      ctx.lineTo(unit * 0.24, hipY + unit * 0.34);
-      ctx.lineTo(unit * 0.3, hipY + unit * 0.7);
-      ctx.stroke();
-    } else {
-      const swing = stride * unit * 0.34;
-      ctx.beginPath();
-      ctx.moveTo(0, hipY);
-      ctx.lineTo(swing, hipY + unit * 0.46);
-      ctx.lineTo(swing * 0.6, hipY + unit * 0.86);
-      ctx.moveTo(0, hipY);
-      ctx.lineTo(-swing, hipY + unit * 0.46);
-      ctx.lineTo(-swing * 0.6, hipY + unit * 0.86);
-      ctx.stroke();
+      ctx.ellipse(side * r * 0.9, r * 0.05, r * 0.2, r * 0.3, 0, 0, TAU);
+      ctx.fill();
     }
 
-    // Torso
-    const torso = ctx.createLinearGradient(0, shoulderY, 0, hipY);
-    torso.addColorStop(0, palette.primary);
-    torso.addColorStop(1, palette.secondary);
-    ctx.fillStyle = torso;
+    // A hint of visor edge when turning, so the head still reads as 3D.
+    if (Math.abs(turn) > 0.02) {
+      ctx.fillStyle = rgba(palette.primary, Math.min(0.8, Math.abs(turn) * 3));
+      ctx.beginPath();
+      ctx.ellipse(Math.sign(turn) * r * 0.72, r * 0.05,
+                  r * 0.22, r * 0.34, 0, 0, TAU);
+      ctx.fill();
+    }
+
+    ctx.restore();
+  }
+
+  /**
+   * Running / airborne pose.
+   *
+   * Legs and arms are driven by one shared phase so they stay in sync: the
+   * arms swing in opposition to the legs, exactly as in a real gait cycle.
+   */
+  _drawPlayerUpright(ctx, u, palette, player, pose, bob, cam, p, lean, sx0, sy0) {
+    const airborne = pose === POSE.JUMP || pose === POSE.FALL;
+    const t = player.runCycle;
+
+    // --- squash & stretch --------------------------------------------------
+    // Landing compresses the body; takeoff elongates it. Volume is roughly
+    // preserved (x scales inversely to y) so the character never looks fat.
+    const sq = player.squash;
+    const st = player.stretch;
+    const sy = 1 - sq * 0.22 + st * 0.14;
+    const sx = 1 + sq * 0.18 - st * 0.10;
+    ctx.scale(sx, sy);
+
+    // Body pitch through the jump arc.
+    if (airborne) ctx.rotate(player.pitch);
+
+    const hipY = -u * (0.86 + bob / u);
+    const shoulderY = -u * 1.5 - bob;
+    const headY = -u * 1.72 - bob;
+    const thigh = u * 0.44;
+    const shin = u * 0.42;
+    const upperArm = u * 0.32;
+    const foreArm = u * 0.30;
+    const legW = Math.max(1.4, u * 0.13);
+    const armW = Math.max(1.2, u * 0.10);
+
+    if (airborne) {
+      // --- airborne: asymmetric tuck ---------------------------------------
+      // Rising = legs tucked up; falling = front leg reaching for the ground.
+      const rise = clamp01(player.vy / 10);
+      const fall = 1 - rise;
+
+      // Trailing leg stays tucked throughout.
+      this._limb(ctx, -u * 0.08, hipY, thigh, shin,
+                 -0.85 - rise * 0.5, 1.5 + rise * 0.6, legW, palette.secondary);
+      // Leading leg extends as we descend, ready to land.
+      this._limb(ctx, u * 0.08, hipY, thigh, shin,
+                 0.55 + fall * 0.5, 0.75 - fall * 0.6, legW, palette.secondary);
+
+      this._torso(ctx, u, palette, shoulderY, hipY);
+
+      // Arms up and out for balance.
+      this._limb(ctx, -u * 0.2, shoulderY + u * 0.04, upperArm, foreArm,
+                 -2.3 + rise * 0.3, -0.7, armW, palette.primary);
+      this._limb(ctx, u * 0.2, shoulderY + u * 0.04, upperArm, foreArm,
+                 2.5 - rise * 0.3, 0.7, armW, palette.primary);
+
+      this._head(ctx, 0, headY, u * 0.2, palette, player.pitch * 0.4);
+      return;
+    }
+
+    // --- grounded run cycle -------------------------------------------------
+    // Rear view: a stride reads as depth + foot lift, so each foot is projected
+    // as a real world-space offset. That makes the trailing foot shrink and the
+    // leading foot grow, which is what actually sells 3D from behind.
+    const g = player.gait;
+
+    const foot = (side, lg) => {
+      // Hip in world space, then the foot offset in metres.
+      const hipWorldY = player.y + 0.86;
+      const hipX = player.x + side * 0.17;
+      // Splay keeps the two legs visually separate from directly behind.
+      const px = hipX + side * 0.10 + (lg.side || 0) * side;
+      const fz = player.z + lg.reach;
+      const fy = player.y + lg.lift;
+
+      const hip = cam.projectNew(hipX, hipWorldY, player.z);
+      const end = cam.projectNew(px, fy, fz);
+      return { hip, end, depth: lg.reach };
+    };
+
+    // Draw the trailing leg first so the leading leg overlaps it.
+    const order = g.legL.reach < g.legR.reach
+      ? [[-1, g.legL, palette.secondary], [1, g.legR, palette.primary]]
+      : [[1, g.legR, palette.secondary], [-1, g.legL, palette.primary]];
+
+    ctx.restore();   // leave the local body transform to draw in screen space
+    for (const [side, lg, color] of order) {
+      const f = foot(side, lg);
+      if (!f.hip.visible || !f.end.visible) continue;
+      // Knee sits between hip and foot, pushed out by the bend amount.
+      const mx = (f.hip.x + f.end.x) / 2 + side * u * 0.04;
+      const my = (f.hip.y + f.end.y) / 2 + lg.bend * u * 0.16;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = Math.max(1.4, u * 0.13);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(f.hip.x, f.hip.y);
+      ctx.quadraticCurveTo(mx, my, f.end.x, f.end.y);
+      ctx.stroke();
+      // Shoe: a small blob that grows as the foot comes toward the camera.
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.ellipse(f.end.x, f.end.y, u * 0.11, u * 0.07, 0, 0, TAU);
+      ctx.fill();
+    }
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(lean * -0.5);
+    ctx.scale(sx, sy);
+
+    this._torso(ctx, u, palette, shoulderY, hipY, g.twist);
+
+    // --- arms -------------------------------------------------------------
+    // From behind, an arm swinging forward mostly gets SHORTER and rises; it
+    // does not sweep sideways. So `reach` drives vertical position and length
+    // rather than rotation, which is what makes the gait read as 3D.
+    const arm = (side, a) => {
+      const sx2 = side * u * 0.24;
+      const sy2 = shoulderY + u * 0.05;
+      const fore = a.reach;
+      const len = u * (0.66 - Math.abs(fore) * 0.16);
+      // Hands stay clear of the torso silhouette so the swing is readable.
+      const handX = sx2 + side * u * (0.16 + fore * 0.10);
+      const handY = sy2 + len - fore * u * 0.34;
+      const elbowX = sx2 + side * u * 0.26;
+      const elbowY = sy2 + len * 0.55 - fore * u * 0.14;
+
+      ctx.strokeStyle = palette.primary;
+      ctx.lineWidth = armW;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(sx2, sy2);
+      ctx.quadraticCurveTo(elbowX, elbowY, handX, handY);
+      ctx.stroke();
+
+      // Hand: grows slightly as it swings toward the camera.
+      ctx.fillStyle = '#f3e2d0';
+      ctx.beginPath();
+      ctx.arc(handX, handY, u * (0.08 - fore * 0.02), 0, TAU);
+      ctx.fill();
+    };
+    arm(-1, g.armL);
+    arm(1, g.armR);
+
+    // Head counter-bobs slightly against the torso, which reads as weight.
+    this._head(ctx, g.twist * u * 0.35, headY + Math.sin(t * 2) * u * 0.015,
+               u * 0.2, palette, g.twist);
+  }
+
+  /**
+   * Shared torso wedge + backpack.
+   * `twist` shears the shoulders slightly to suggest counter-rotation.
+   */
+  _torso(ctx, u, palette, shoulderY, hipY, twist = 0) {
+    const sh = twist * u * 0.18;
+
+    const grad = ctx.createLinearGradient(0, shoulderY, 0, hipY);
+    grad.addColorStop(0, palette.primary);
+    grad.addColorStop(1, palette.secondary);
+    ctx.fillStyle = grad;
     ctx.beginPath();
-    ctx.moveTo(-unit * 0.26, shoulderY);
-    ctx.lineTo(unit * 0.26, shoulderY);
-    ctx.lineTo(unit * 0.19, hipY);
-    ctx.lineTo(-unit * 0.19, hipY);
+    ctx.moveTo(-u * 0.27 + sh, shoulderY);
+    ctx.lineTo(u * 0.27 + sh, shoulderY);
+    ctx.lineTo(u * 0.2, hipY);
+    ctx.lineTo(-u * 0.2, hipY);
     ctx.closePath();
     ctx.fill();
 
-    // Arms
-    ctx.strokeStyle = palette.primary;
-    ctx.lineWidth = limb * 0.85;
-    if (airborne) {
-      ctx.beginPath();
-      ctx.moveTo(-unit * 0.2, shoulderY + unit * 0.05);
-      ctx.lineTo(-unit * 0.46, shoulderY - unit * 0.26);
-      ctx.moveTo(unit * 0.2, shoulderY + unit * 0.05);
-      ctx.lineTo(unit * 0.5, shoulderY - unit * 0.18);
-      ctx.stroke();
-    } else {
-      const armSwing = -stride * unit * 0.3;
-      ctx.beginPath();
-      ctx.moveTo(-unit * 0.2, shoulderY + unit * 0.05);
-      ctx.lineTo(-unit * 0.2 + armSwing, shoulderY + unit * 0.4);
-      ctx.moveTo(unit * 0.2, shoulderY + unit * 0.05);
-      ctx.lineTo(unit * 0.2 - armSwing, shoulderY + unit * 0.4);
-      ctx.stroke();
-    }
-
-    // Head + visor
-    ctx.fillStyle = '#f3e2d0';
-    ctx.beginPath();
-    ctx.arc(0, headY, unit * 0.19, 0, TAU);
-    ctx.fill();
-    ctx.fillStyle = rgba(palette.primary, 0.95);
-    ctx.beginPath();
-    ctx.ellipse(unit * 0.05, headY - unit * 0.02, unit * 0.16, unit * 0.09, 0, 0, TAU);
-    ctx.fill();
-
-    // Backpack accent.
+    // Backpack, centred on the back - the main thing visible from behind.
     ctx.fillStyle = palette.secondary;
-    ctx.fillRect(-unit * 0.3, shoulderY + unit * 0.08, unit * 0.11, unit * 0.36);
+    const bw = u * 0.3, bh = u * 0.44;
+    const bx = -bw / 2 + sh * 0.6, by = shoulderY + u * 0.1;
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(bx, by, bw, bh, u * 0.07);
+    else ctx.rect(bx, by, bw, bh);
+    ctx.fill();
+
+    // Straps + a highlight so the pack does not read as a flat slab.
+    ctx.strokeStyle = rgba(palette.primary, 0.55);
+    ctx.lineWidth = Math.max(1, u * 0.035);
+    ctx.beginPath();
+    ctx.moveTo(bx + bw * 0.28, by);
+    ctx.lineTo(bx + bw * 0.28, by + bh);
+    ctx.moveTo(bx + bw * 0.72, by);
+    ctx.lineTo(bx + bw * 0.72, by + bh);
+    ctx.stroke();
   }
 
-  _drawPlayerSliding(ctx, unit, palette, player) {
-    const limb = Math.max(1.2, unit * 0.1);
-    ctx.lineCap = 'round';
+  /**
+   * Slide pose.
+   *
+   * `blend` (0..1) drives the whole crouch, so entering and leaving a slide is
+   * a smooth transition rather than a snap between two poses.
+   */
+  _drawPlayerSliding(ctx, u, palette, player) {
+    const b = clamp01(player.duckBlend);
 
-    // Body laid back, low to the ground.
-    const bodyY = -unit * 0.34;
-    const torso = ctx.createLinearGradient(-unit * 0.5, 0, unit * 0.4, 0);
-    torso.addColorStop(0, palette.secondary);
-    torso.addColorStop(1, palette.primary);
-    ctx.fillStyle = torso;
-    ctx.beginPath();
-    ctx.ellipse(0, bodyY, unit * 0.5, unit * 0.24, -0.12, 0, TAU);
-    ctx.fill();
+    // Rotate the whole body toward horizontal and drop it toward the deck.
+    ctx.translate(0, -u * 0.06 * (1 - b));
+    ctx.rotate(-b * 0.34);
 
-    // Trailing legs.
-    ctx.strokeStyle = palette.secondary;
-    ctx.lineWidth = limb;
-    ctx.beginPath();
-    ctx.moveTo(-unit * 0.3, bodyY + unit * 0.05);
-    ctx.lineTo(-unit * 0.72, bodyY + unit * 0.16);
-    ctx.moveTo(-unit * 0.3, bodyY + unit * 0.12);
-    ctx.lineTo(-unit * 0.66, bodyY + unit * 0.26);
-    ctx.stroke();
+    const hipY = -u * (0.86 - b * 0.42);
+    const shoulderY = -u * (1.5 - b * 0.72);
+    const headY = -u * (1.72 - b * 0.86);
+    const thigh = u * 0.44;
+    const shin = u * 0.42;
+    const legW = Math.max(1.4, u * 0.13);
+    const armW = Math.max(1.2, u * 0.10);
 
-    // Head, tucked forward.
-    ctx.fillStyle = '#f3e2d0';
-    ctx.beginPath();
-    ctx.arc(unit * 0.42, bodyY - unit * 0.1, unit * 0.17, 0, TAU);
-    ctx.fill();
-    ctx.fillStyle = rgba(palette.primary, 0.95);
-    ctx.beginPath();
-    ctx.ellipse(unit * 0.47, bodyY - unit * 0.12, unit * 0.14, unit * 0.08, 0, 0, TAU);
-    ctx.fill();
+    // Legs fold forward and flatten out as the crouch deepens.
+    this._limb(ctx, -u * 0.05, hipY, thigh, shin,
+               0.4 + b * 0.9, 0.5 + b * 1.0, legW, palette.secondary);
+    this._limb(ctx, u * 0.05, hipY, thigh, shin,
+               0.6 + b * 1.15, 0.35 + b * 0.9, legW, palette.primary);
 
-    // Friction sparks at the contact point.
-    ctx.strokeStyle = rgba('#ffd23e', 0.7);
-    ctx.lineWidth = Math.max(1, unit * 0.03);
-    for (let i = 0; i < 3; i++) {
-      const sx = -unit * (0.4 + Math.random() * 0.5);
+    this._torso(ctx, u, palette, shoulderY, hipY);
+
+    // Leading arm braces forward, trailing arm tucks back.
+    this._limb(ctx, u * 0.16, shoulderY + u * 0.05, u * 0.32, u * 0.30,
+               1.1 + b * 0.5, 0.5, armW, palette.primary);
+    this._limb(ctx, -u * 0.16, shoulderY + u * 0.05, u * 0.32, u * 0.30,
+               -1.5 - b * 0.6, -0.6, armW, palette.primary);
+
+    this._head(ctx, u * 0.1 * b, headY, u * 0.2, palette, b * 0.3);
+
+    // Friction sparks kick off the heels, scaled by how deep the slide is.
+    if (b > 0.4) {
+      ctx.strokeStyle = rgba('#ffd23e', 0.55 * b);
+      ctx.lineWidth = Math.max(1, u * 0.03);
       ctx.beginPath();
-      ctx.moveTo(sx, -unit * 0.04);
-      ctx.lineTo(sx - unit * 0.2, -unit * 0.04 - Math.random() * unit * 0.14);
+      for (let i = 0; i < 3; i++) {
+        const sx = -u * (0.3 + Math.random() * 0.5);
+        ctx.moveTo(sx, -u * 0.04);
+        ctx.lineTo(sx - u * (0.15 + Math.random() * 0.2),
+                   -u * 0.04 - Math.random() * u * 0.16);
+      }
       ctx.stroke();
     }
   }
 
-  _drawPlayerCrashed(ctx, unit, palette, time) {
-    // Slumped, rotating slightly - reads as "wiped out".
-    ctx.rotate(Math.sin(time * 2) * 0.1 - 0.5);
-    ctx.fillStyle = palette.secondary;
-    ctx.beginPath();
-    ctx.ellipse(0, -unit * 0.3, unit * 0.42, unit * 0.26, 0, 0, TAU);
-    ctx.fill();
-    ctx.fillStyle = '#f3e2d0';
-    ctx.beginPath();
-    ctx.arc(unit * 0.34, -unit * 0.42, unit * 0.18, 0, TAU);
-    ctx.fill();
-    ctx.strokeStyle = palette.primary;
-    ctx.lineWidth = Math.max(1.2, unit * 0.09);
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-    ctx.moveTo(-unit * 0.2, -unit * 0.2);
-    ctx.lineTo(-unit * 0.6, -unit * 0.5);
-    ctx.moveTo(-unit * 0.1, -unit * 0.35);
-    ctx.lineTo(-unit * 0.3, -unit * 0.75);
-    ctx.stroke();
+  /**
+   * Crash pose.
+   *
+   * Drives off `deathTime` rather than the global clock so the tumble always
+   * starts from the same frame no matter when in the run you died.
+   */
+  _drawPlayerCrashed(ctx, u, palette, player) {
+    const t = player.deathTime;
+    // Tumble fast at first, then settle - like a body losing momentum.
+    const settle = 1 - Math.exp(-t * 2.4);
+    const rot = -0.4 - settle * 1.15 + Math.sin(t * 9) * 0.12 * (1 - settle);
+    ctx.rotate(rot);
+
+    const hipY = -u * 0.4;
+    const shoulderY = -u * 0.95;
+    const headY = -u * 1.15;
+    const legW = Math.max(1.4, u * 0.13);
+    const armW = Math.max(1.2, u * 0.10);
+
+    // Limbs splayed at loose, asymmetric angles. Drawn as explicit curves in
+    // local space (the world-space leg rig above assumes an upright runner and
+    // would fight the tumble rotation).
+    const sprawl = (x0, y0, dx, dy, w, color) => {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = w;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x0, y0);
+      ctx.quadraticCurveTo(x0 + dx * 0.5, y0 + dy * 0.35, x0 + dx, y0 + dy);
+      ctx.stroke();
+    };
+
+    const wob = Math.sin(t * 7) * u * 0.06;
+    // Legs.
+    sprawl(-u * 0.08, hipY, -u * 0.52 + wob, u * 0.55, legW, palette.secondary);
+    sprawl(u * 0.08, hipY, u * 0.62 - wob, u * 0.34, legW, palette.primary);
+
+    this._torso(ctx, u, palette, shoulderY, hipY, 0);
+
+    // Arms flung outward.
+    sprawl(-u * 0.22, shoulderY + u * 0.06, -u * 0.55 - wob, -u * 0.26,
+           armW, palette.primary);
+    sprawl(u * 0.22, shoulderY + u * 0.06, u * 0.5 + wob, -u * 0.36,
+           armW, palette.primary);
+
+    this._head(ctx, 0, headY, u * 0.2, palette, 0);
+
+    // Stun stars orbit the head for the first moment after the hit.
+    if (t < 1.4) {
+      const fade = clamp01(1.4 - t);
+      ctx.fillStyle = rgba('#ffd23e', fade * 0.9);
+      for (let i = 0; i < 3; i++) {
+        const a = t * 6 + (i / 3) * TAU;
+        const sx = Math.cos(a) * u * 0.42;
+        const sy = headY - u * 0.34 + Math.sin(a) * u * 0.14;
+        const r = u * 0.07;
+        ctx.beginPath();
+        // Four-point sparkle.
+        for (let k = 0; k < 8; k++) {
+          const ang = (k / 8) * TAU;
+          const rad = k % 2 === 0 ? r : r * 0.42;
+          const px = sx + Math.cos(ang) * rad;
+          const py = sy + Math.sin(ang) * rad;
+          k === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
   }
+
 
   // =========================================================================
   // Telegraphs & world-space text
@@ -1195,10 +1449,50 @@ export class Renderer {
       ctx.fillRect(0, 0, this.width, this.height);
     }
 
+    // Hoverboard stock. Drawn on the canvas rather than in the React HUD so it
+    // stays correct on the frame a board is spent, without waiting for a
+    // re-render. Hidden outside a run and when the stock is empty.
+    if (state.playing && state.hoverboards > 0) {
+      this._drawBoardCount(state.hoverboards);
+    }
+
     // Vignette last, to focus the eye centre-frame.
     if (this._vignette) {
       ctx.fillStyle = this._vignette;
       ctx.fillRect(0, 0, this.width, this.height);
     }
+  }
+
+  /** Small "board x N" pill in the bottom-left safe area. */
+  _drawBoardCount(count) {
+    const ctx = this.ctx;
+    const pad = 16;
+    const h = 26;
+    const y = this.height - pad - h;
+    const label = `BOARD x${count}`;
+
+    ctx.font = '700 12px ui-sans-serif, system-ui, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    const w = ctx.measureText(label).width + 34;
+
+    ctx.fillStyle = 'rgba(5, 8, 20, 0.55)';
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(pad, y, w, h, 13);
+    else ctx.rect(pad, y, w, h);
+    ctx.fill();
+
+    ctx.strokeStyle = 'rgba(34, 232, 255, 0.5)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    // Board glyph: a stubby ellipse, matching the one under the runner.
+    ctx.fillStyle = '#22e8ff';
+    ctx.beginPath();
+    ctx.ellipse(pad + 15, y + h / 2, 8, 3, 0, 0, TAU);
+    ctx.fill();
+
+    ctx.fillStyle = 'rgba(233, 240, 255, 0.92)';
+    ctx.fillText(label, pad + 27, y + h / 2 + 1);
   }
 }

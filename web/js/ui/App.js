@@ -170,6 +170,11 @@ export function App() {
         toast('SHIELD DOWN', 'warn');
         break;
       case 'hoverboardUsed':
+        // The engine has already spent the board and mirrored the new count to
+        // its own inventory. Commit the same spend to the profile so the shop
+        // and the next run agree; without this, `applyUpgrades()` would restore
+        // the board from the stale profile on the following run.
+        commitHoverboardSpend(payload);
         toast(`HOVERBOARD SAVE - ${payload} LEFT`, 'gold', 2400);
         break;
       case 'comboUp':
@@ -186,6 +191,22 @@ export function App() {
   // -------------------------------------------------------------------------
   // Run lifecycle
   // -------------------------------------------------------------------------
+
+  /**
+   * Record a spent hoverboard against the profile.
+   *
+   * `remaining` is the authoritative post-spend count from the engine, so this
+   * assigns rather than decrements: replaying the same event can never take a
+   * second board. The localStorage write inside `api.consume` is synchronous,
+   * so the spend survives an immediate reload.
+   */
+  function commitHoverboardSpend(remaining) {
+    const left = Math.max(0, Math.floor(remaining));
+    setProfile((current) => (current
+      ? { ...current, upgrades: { ...current.upgrades, hoverboard: left } }
+      : current));
+    api.setConsumable('hoverboard', left);
+  }
 
   const startRun = useCallback(async () => {
     const game = gameRef.current;
@@ -205,6 +226,10 @@ export function App() {
 
     game.applyUpgrades(profile.upgrades || {}, api.shop);
     game.setSkin(profile.skin || 'cyan');
+    // Reconcile the engine's consumable stock with the profile before the run.
+    // This is what migrates players who predate the inventory key, and repairs
+    // any drift from a run that ended without the spend being committed.
+    game.syncInventory({ hoverboard: (profile.upgrades || {}).hoverboard || 0 });
     game.start({ seed: session.seed, skin: profile.skin || 'cyan' });
   }, [profile, settings.sound, settings.music]);
 

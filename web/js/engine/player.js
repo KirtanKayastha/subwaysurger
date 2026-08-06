@@ -66,6 +66,12 @@ export class Player {
     this.invuln = 0;
     /** True while riding a hoverboard (cosmetic + one free hit). */
     this.hoverboard = false;
+    /**
+     * Hoverboards carried into this run. Owned by the player rather than the
+     * game loop so activation and the count that gates it live together; the
+     * game mirrors it into its persisted inventory.
+     */
+    this.hoverboards = 0;
 
     /** Animation clocks. */
     this.runCycle = 0;
@@ -78,6 +84,20 @@ export class Player {
     this.justJumped = false;
     /** Fall-through-gap flag so the game can distinguish death causes. */
     this.fellInGap = false;
+
+    // --- animation-only state (never affects physics or collision) --------
+    /** Landing squash: 1 -> 0 over ~0.18s after touchdown. */
+    this.squash = 0;
+    /** Takeoff stretch: 1 -> 0 over ~0.14s after a jump starts. */
+    this.stretch = 0;
+    /** Duck blend 0..1, eased so the crouch is not instant. */
+    this.duckBlend = 0;
+    /** Airborne body pitch in radians, eased in/out across the arc. */
+    this.pitch = 0;
+    /** Counts up while dead so the crash pose can animate. */
+    this.deathTime = 0;
+    /** Impact flash 1 -> 0, drives the red hit tint. */
+    this.hitFlash = 0;
   }
 
   /** Current collision half-extents, accounting for the slide pose. */
@@ -251,6 +271,40 @@ export class Player {
 
     // --- timers ---------------------------------------------------------
     if (this.invuln > 0) this.invuln = Math.max(0, this.invuln - dt);
+
+    this._updateAnimation(dt);
+  }
+
+  /**
+   * Advance animation-only state.
+   *
+   * Kept strictly separate from the physics above: nothing here feeds back
+   * into position or collision, so visual polish can never change gameplay.
+   */
+  _updateAnimation(dt) {
+    // Squash on landing, stretch on takeoff. Both decay fast so they read as
+    // an impulse rather than a pose.
+    if (this.justLanded > 0) this.squash = Math.min(1, 0.45 + this.justLanded);
+    if (this.justJumped) this.stretch = 1;
+    this.squash = Math.max(0, this.squash - dt / 0.18);
+    this.stretch = Math.max(0, this.stretch - dt / 0.14);
+
+    // Ease the crouch in and out instead of snapping between heights.
+    this.duckBlend = damp(this.duckBlend, this.ducking ? 1 : 0, 22, dt);
+
+    // Airborne pitch: lean back on the way up, tuck forward on the way down.
+    // clamp keeps a long fall from spinning the body past a readable angle.
+    const targetPitch = this.grounded
+      ? 0
+      : clamp(-this.vy * 0.022, -0.34, 0.42);
+    this.pitch = damp(this.pitch, targetPitch, 9, dt);
+
+    this.hitFlash = Math.max(0, this.hitFlash - dt / 0.28);
+  }
+
+  /** Trigger the impact flash (called by the game on any hit). */
+  flashHit() {
+    this.hitFlash = 1;
   }
 
   /**
@@ -262,7 +316,21 @@ export class Player {
     this.y += this.vy * dt;
     this.z += 1.5 * dt;              // slight forward slump
     this.runCycle += dt * 6;
+    this.deathTime += dt;
+    this.hitFlash = Math.max(0, this.hitFlash - dt / 0.28);
     if (this.y < -2) { this.y = -2; this.vy = 0; }
+  }
+
+  /**
+   * Spend one hoverboard, if any remain.
+   *
+   * Returns false when the stock is empty, which is what makes a fatal hit
+   * actually fatal. The caller must treat a false return as "no save left".
+   */
+  consumeHoverboard() {
+    if (this.hoverboards <= 0) return false;
+    this.hoverboards--;
+    return true;
   }
 
   /** Grant invulnerability and pop the runner up after a hoverboard save. */
@@ -292,6 +360,59 @@ export class Player {
   /** Leg swing phase in radians. */
   get stride() {
     return Math.sin(this.runCycle) * 0.85;
+  }
+
+  /**
+   * Rear-view gait model.
+   *
+   * The camera sits behind and above the runner, so a stride reads mostly as
+   * depth (z) plus foot lift (y) - NOT as lateral swing. Values are in metres
+   * and are consumed directly by the renderer, which projects them like any
+   * other world offset so the far foot correctly shrinks.
+   *
+   *   lift  +y  foot height off the deck
+   *   reach +z  forward/back of the hip (positive = ahead of the runner)
+   *
+   * Legs are exactly pi out of phase; arms mirror the opposite leg.
+   */
+  get gait() {
+    const t = this.runCycle;
+    const air = !this.grounded;
+
+    // Amplitude collapses in the air (legs tuck) and while sliding.
+    const amp = air ? 0.35 : 1 - this.duckBlend * 0.7;
+
+    const leg = (phase) => {
+      const s = Math.sin(phase);
+      const c = Math.cos(phase);
+      return {
+        // Feet only lift on the recovery half of the cycle; a foot planted on
+        // the ground must not sink through it.
+        lift: Math.max(0, s) * 0.52 * amp,
+        reach: c * 0.62 * amp,
+        // Knee bends hardest as the leg passes under the hip.
+        bend: (0.3 + Math.max(0, -c) * 1.1) * amp,
+        // Sideways splay keeps the two legs from overlapping into one blob
+        // when viewed from directly behind.
+        side: s * 0.06 * amp,
+      };
+    };
+
+    const legL = leg(t);
+    const legR = leg(t + Math.PI);
+
+    return {
+      legL,
+      legR,
+      // Arms oppose legs: right arm drives forward with the left leg.
+      armL: { reach: -legL.reach * 0.85, lift: 0 },
+      armR: { reach: -legR.reach * 0.85, lift: 0 },
+      // Forward lean grows with speed and while airborne.
+      lean: 0.12 + (air ? 0.06 : 0) + this.duckBlend * 0.2,
+      // Shoulder counter-rotation around the vertical axis.
+      twist: Math.sin(t) * 0.10 * amp,
+      bob: this.bob,
+    };
   }
 
   /** True on the frame a foot strikes the ground (for dust + audio). */

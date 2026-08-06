@@ -435,8 +435,14 @@ export function Shop({ profile, catalog, skins, onBuy, onBuySkin, onEquip, onClo
                 h('div', { className: 'shop-item__body' },
                   h('div', { className: 'shop-item__name' },
                     item.name,
-                    isConsumable && level > 0
-                      ? h('span', { style: { color: 'var(--cyan)' } }, `  x${level}`)
+                    // Consumables always show their stock, including x0, so an
+                    // empty inventory is visible rather than implied.
+                    isConsumable
+                      ? h('span', {
+                          style: {
+                            color: level > 0 ? 'var(--cyan)' : 'var(--text-faint)',
+                          },
+                        }, `  x${level}`)
                       : null,
                   ),
                   h('div', { className: 'shop-item__desc' }, item.desc),

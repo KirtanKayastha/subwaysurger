@@ -280,4 +280,5 @@ export const STORAGE_KEYS = {
   settings: 'neonrush.settings',
   scores: 'neonrush.scores',
   missions: 'neonrush.missions',
+  inventory: 'neonrush.inventory',
 };
