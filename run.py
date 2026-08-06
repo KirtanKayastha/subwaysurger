@@ -11,10 +11,10 @@ NEON RUSH - launcher.
 Environment (used when the matching flag is not passed):
     PORT          bind port - set by most PaaS hosts
     HOST          bind address, defaults to 0.0.0.0 when PORT is set
-    DATABASE_URL  database location; sqlite:// paths and bare paths supported
+    DATABASE_URL  database location; postgresql://, postgres://, sqlite://, or bare path
     NEONRUSH_DB   explicit SQLite path, takes precedence over DATABASE_URL
 
-Requires nothing beyond the Python standard library (3.10+).
+Requires python-dotenv, psycopg2-binary for deployment.
 """
 
 from __future__ import annotations
@@ -38,6 +38,22 @@ try:  # pragma: no cover - depends on the deployment environment
     load_dotenv()
 except ImportError:  # pragma: no cover
     pass
+
+
+def is_postgres_url(url: str | None) -> bool:
+    """Check if URL is PostgreSQL connection string."""
+    if not url:
+        return False
+    return url.startswith("postgresql://") or url.startswith("postgres://")
+
+
+def psycopg2_missing() -> bool:
+    """True when the PostgreSQL driver is unavailable."""
+    try:
+        import psycopg2  # noqa: F401
+    except ImportError:
+        return True
+    return False
 
 
 def _env_port(default: int) -> int:
@@ -66,12 +82,9 @@ def _env_host(default: str) -> str:
 
 def _env_db() -> str | None:
     """
-    SQLite path from the environment.
+    Database target from the environment.
 
-    ``DATABASE_URL`` is accepted for host compatibility. Only SQLite URLs and
-    bare filesystem paths are understood - a postgres:// URL is reported rather
-    than silently ignored, since falling back to a local file would look like
-    data loss.
+    Returns either a PostgreSQL connection URL or a filesystem path for SQLite.
     """
     explicit = os.getenv("NEONRUSH_DB")
     if explicit:
@@ -81,6 +94,19 @@ def _env_db() -> str | None:
     if not url:
         return None
 
+    # PostgreSQL: hand the URL through untouched.
+    if is_postgres_url(url):
+        if psycopg2_missing():
+            print(
+                "error: DATABASE_URL points at PostgreSQL but psycopg2 is not "
+                "installed.\n"
+                "       Install it with:  pip install psycopg2-binary",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        return url
+
+    # SQLite URL forms and bare paths.
     if url.startswith("sqlite:///"):
         return url[len("sqlite:///"):]
     if url.startswith("sqlite://"):
@@ -90,10 +116,9 @@ def _env_db() -> str | None:
 
     scheme = url.split("://", 1)[0]
     print(
-        f"error: DATABASE_URL uses '{scheme}://', but this server stores data in "
-        f"SQLite.\n"
-        f"       Set NEONRUSH_DB to a writable file path, or unset DATABASE_URL "
-        f"to use the default.",
+        f"error: DATABASE_URL uses an unsupported scheme '{scheme}://'.\n"
+        f"       Supported: postgresql://, postgres://, sqlite:///<path>, or a "
+        f"bare file path.",
         file=sys.stderr,
     )
     raise SystemExit(2)
@@ -114,7 +139,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=None,
                         help=f"port; scans upward if busy (default: $PORT or {config.DEFAULT_PORT})")
     parser.add_argument("--db", default=None,
-                        help=f"SQLite path (default: $DATABASE_URL or {config.DEFAULT_DB_PATH})")
+                        help=f"database path/URL (default: $DATABASE_URL or {config.DEFAULT_DB_PATH})")
     parser.add_argument("--no-browser", action="store_true",
                         help="do not auto-open a browser window")
     parser.add_argument("--reset-db", action="store_true",
@@ -132,17 +157,30 @@ def main(argv: list[str] | None = None) -> int:
     port = args.port if args.port is not None else _env_port(config.DEFAULT_PORT)
     db_setting = args.db or _env_db()
 
-    db_path = Path(db_setting) if db_setting else config.DEFAULT_DB_PATH
-    if args.reset_db and db_path.exists():
-        # WAL mode leaves sidecar files; remove them too for a clean slate.
-        for suffix in ("", "-wal", "-shm"):
-            candidate = Path(str(db_path) + suffix)
-            if candidate.exists():
-                candidate.unlink()
-        print(f"  Removed {db_path}")
+    postgres = is_postgres_url(db_setting)
 
-    # The parent directory may not exist on a fresh container volume.
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if postgres:
+        # A connection URL, not a path: no file handling applies.
+        target = db_setting
+        if args.reset_db:
+            print(
+                "error: --reset-db only applies to SQLite. Drop the tables on "
+                "the server instead.",
+                file=sys.stderr,
+            )
+            return 2
+    else:
+        db_path = Path(db_setting) if db_setting else config.DEFAULT_DB_PATH
+        if args.reset_db and db_path.exists():
+            # WAL mode leaves sidecar files; remove them too for a clean slate.
+            for suffix in ("", "-wal", "-shm"):
+                candidate = Path(str(db_path) + suffix)
+                if candidate.exists():
+                    candidate.unlink()
+            print(f"  Removed {db_path}")
+        # The parent directory may not exist on a fresh container volume.
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        target = str(db_path)
 
     if not config.WEB_DIR.is_dir():
         print(f"error: frontend directory missing: {config.WEB_DIR}", file=sys.stderr)
@@ -155,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     serve(
         host=host,
         port=port,
-        db_path=str(db_path),
+        db_path=target,
         open_browser=open_browser,
         verbose=args.verbose,
     )
