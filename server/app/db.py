@@ -30,7 +30,15 @@ from typing import Any, Iterable, Iterator, Optional
 
 from . import config
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
+
+
+class NameTakenError(Exception):
+    """Raised when a display name is already claimed by another player."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(f"name already taken: {name}")
+        self.name = name
 
 
 # --------------------------------------------------------------------------
@@ -149,6 +157,86 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (SCHEMA_VERSION,),
             )
+        self._migrate_unique_names()
+        self._migrate_password_column()
+
+    def _migrate_password_column(self) -> None:
+        """
+        Add ``players.password_hash`` to databases created before passwords.
+
+        Existing players keep an empty hash, which means "no password set":
+        they may claim one on their next return visit rather than being locked
+        out of their own progress.
+        """
+        with self.tx() as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(players)")}
+            if "password_hash" not in cols:
+                conn.execute(
+                    "ALTER TABLE players ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''"
+                )
+
+    def _migrate_unique_names(self) -> None:
+        """
+        Make display names case-insensitively unique.
+
+        Databases created before names were claimable contain many players
+        sharing the default name, so a UNIQUE index cannot simply be declared
+        in schema.sql - it would fail to build and take the server down on
+        startup. Duplicates are resolved first, oldest player keeping the bare
+        name, then the index is created.
+
+        Idempotent: once the index exists this is a single cheap query.
+        """
+        with self.tx() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'index' AND name = 'idx_players_name_unique'"
+            ).fetchone()
+            if exists:
+                return
+
+            dupes = conn.execute(
+                """
+                SELECT LOWER(name) AS key, COUNT(*) AS n
+                  FROM players
+                 GROUP BY LOWER(name)
+                HAVING n > 1
+                """
+            ).fetchall()
+
+            for dupe in dupes:
+                # Oldest row keeps the name; the rest get a numeric suffix,
+                # truncated so the result still fits NAME_MAX_LEN.
+                rows = conn.execute(
+                    "SELECT id, name FROM players WHERE LOWER(name) = ? "
+                    "ORDER BY created_ms ASC, id ASC",
+                    (dupe["key"],),
+                ).fetchall()
+                for index, row in enumerate(rows[1:], start=2):
+                    base = str(row["name"])
+                    for attempt in range(index, index + 10000):
+                        suffix = str(attempt)
+                        trimmed = base[: max(1, config.NAME_MAX_LEN - len(suffix))]
+                        candidate = f"{trimmed}{suffix}"
+                        clash = conn.execute(
+                            "SELECT 1 FROM players WHERE LOWER(name) = LOWER(?) LIMIT 1",
+                            (candidate,),
+                        ).fetchone()
+                        if not clash:
+                            conn.execute(
+                                "UPDATE players SET name = ?, updated_ms = ? WHERE id = ?",
+                                (candidate, now_ms(), row["id"]),
+                            )
+                            conn.execute(
+                                "UPDATE scores SET name = ? WHERE player_id = ?",
+                                (candidate, row["id"]),
+                            )
+                            break
+
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_players_name_unique "
+                "ON players(name COLLATE NOCASE)"
+            )
 
     # -- generic query helpers ---------------------------------------------
 
@@ -162,23 +250,47 @@ class Database:
     # Players
     # ======================================================================
 
-    def create_player(self, name: str) -> tuple[dict, str]:
+    def name_taken(self, name: str, *, exclude_player_id: Optional[int] = None) -> bool:
         """
-        Register a new player.
+        Is this display name already claimed by someone else?
+
+        Case-insensitive, matching the unique index. Callers that then write
+        must re-check inside the same transaction; this is for cheap read-only
+        probes such as the availability endpoint.
+        """
+        sql = "SELECT 1 FROM players WHERE LOWER(name) = LOWER(?)"
+        params: list[Any] = [name]
+        if exclude_player_id is not None:
+            sql += " AND id != ?"
+            params.append(exclude_player_id)
+        return self.query_one(sql + " LIMIT 1", params) is not None
+
+    def create_player(self, name: str, password_hash: str = "") -> tuple[dict, str]:
+        """
+        Register a new player, claiming ``name``.
 
         Returns ``(player_dict, raw_token)``. The raw token is shown to the
         caller exactly once; only its hash is persisted.
+
+        Raises :class:`NameTakenError` if the name is already claimed. The
+        check runs inside the write transaction, so two clients racing for the
+        same name cannot both win.
         """
         token = new_token()
         ts = now_ms()
         with self.tx() as conn:
+            clash = conn.execute(
+                "SELECT 1 FROM players WHERE LOWER(name) = LOWER(?) LIMIT 1", (name,)
+            ).fetchone()
+            if clash:
+                raise NameTakenError(name)
             cur = conn.execute(
                 """
                 INSERT INTO players
-                    (public_id, token_hash, name, created_ms, updated_ms)
-                VALUES (?, ?, ?, ?, ?)
+                    (public_id, token_hash, name, password_hash, created_ms, updated_ms)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (new_public_id(), hash_token(token), name, ts, ts),
+                (new_public_id(), hash_token(token), name, password_hash, ts, ts),
             )
             pid = cur.lastrowid
             # Everyone starts owning the default skin.
@@ -188,6 +300,43 @@ class Database:
             )
             row = conn.execute("SELECT * FROM players WHERE id = ?", (pid,)).fetchone()
         return self._player_dict(row), token
+
+    def player_by_name(self, name: str) -> Optional[dict]:
+        """Look up a player by display name (case-insensitive), or ``None``."""
+        row = self.query_one(
+            "SELECT * FROM players WHERE LOWER(name) = LOWER(?) LIMIT 1", (name,)
+        )
+        return self._player_dict(row) if row else None
+
+    def password_hash_for(self, player_id: int) -> str:
+        """Stored password hash, or ``''`` when the player has none."""
+        row = self.query_one(
+            "SELECT password_hash FROM players WHERE id = ?", (player_id,)
+        )
+        return str(row["password_hash"]) if row and row["password_hash"] else ""
+
+    def set_password_hash(self, player_id: int, password_hash: str) -> None:
+        """Attach a password to an account that has none (or replace it)."""
+        with self.tx() as conn:
+            conn.execute(
+                "UPDATE players SET password_hash = ?, updated_ms = ? WHERE id = ?",
+                (password_hash, now_ms(), player_id),
+            )
+
+    def rotate_token(self, player_id: int) -> str:
+        """
+        Issue a fresh bearer token for a player and invalidate the old one.
+
+        Called after a successful sign-in so each browser gets its own valid
+        credential without the previous device's token leaking between them.
+        """
+        token = new_token()
+        with self.tx() as conn:
+            conn.execute(
+                "UPDATE players SET token_hash = ?, updated_ms = ? WHERE id = ?",
+                (hash_token(token), now_ms(), player_id),
+            )
+        return token
 
     def player_by_token(self, token: str) -> Optional[dict]:
         """Look up a player by raw bearer token, or ``None``."""
@@ -203,8 +352,20 @@ class Database:
         return self._player_dict(row) if row else None
 
     def rename_player(self, player_id: int, name: str) -> None:
-        """Update a display name (also backfills historical score rows)."""
+        """
+        Update a display name (also backfills historical score rows).
+
+        Raises :class:`NameTakenError` if another player already holds the
+        name. Re-checked inside the transaction so concurrent renames cannot
+        both succeed.
+        """
         with self.tx() as conn:
+            clash = conn.execute(
+                "SELECT 1 FROM players WHERE LOWER(name) = LOWER(?) AND id != ? LIMIT 1",
+                (name, player_id),
+            ).fetchone()
+            if clash:
+                raise NameTakenError(name)
             conn.execute(
                 "UPDATE players SET name = ?, updated_ms = ? WHERE id = ?",
                 (name, now_ms(), player_id),

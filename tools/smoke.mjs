@@ -46,6 +46,21 @@ const readState = (page) => page.evaluate(() => {
   };
 });
 
+/**
+ * Get past the name gate that a fresh browser profile always sees.
+ *
+ * Names are unique, so each context claims its own. Returns the claimed name.
+ */
+async function claimName(page, tag) {
+  const gate = await page.locator('text=CHOOSE YOUR NAME').count();
+  if (!gate) return null;
+  const name = `S${tag}${Date.now().toString().slice(-6)}`.slice(0, 16);
+  await page.fill('input', name);
+  await page.locator('button:has-text("START")').click();
+  await page.waitForSelector('button:has-text("PLAY")', { timeout: 15000 });
+  return name;
+}
+
 const browser = await chromium.launch();
 
 // =========================================================================
@@ -60,6 +75,8 @@ const browser = await chromium.launch();
 
   // Expose the engine for assertions.
   await page.waitForFunction(() => !!document.querySelector('#ui-root .btn--primary'), { timeout: 15000 });
+  const claimed = await claimName(page, 'D');
+  log(`claimed name: ${claimed}`);
   log('menu rendered');
 
   const title = await page.textContent('.title');
@@ -165,6 +182,7 @@ const browser = await chromium.launch();
 
   await page.goto(BASE, { waitUntil: 'networkidle' });
   await page.waitForFunction(() => !!document.querySelector('#ui-root .btn--primary'), { timeout: 15000 });
+  await claimName(page, 'M');
 
   const overflow = await page.evaluate(() =>
     document.documentElement.scrollWidth > window.innerWidth + 1);

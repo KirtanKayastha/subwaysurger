@@ -8,6 +8,12 @@ NEON RUSH - launcher.
     python run.py --no-browser    # just serve
     python run.py --reset-db      # wipe scores and start fresh
 
+Environment (used when the matching flag is not passed):
+    PORT          bind port - set by most PaaS hosts
+    HOST          bind address, defaults to 0.0.0.0 when PORT is set
+    DATABASE_URL  database location; sqlite:// paths and bare paths supported
+    NEONRUSH_DB   explicit SQLite path, takes precedence over DATABASE_URL
+
 Requires nothing beyond the Python standard library (3.10+).
 """
 
@@ -24,6 +30,74 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from server.app import config  # noqa: E402
 from server.app.server import serve  # noqa: E402
 
+# Load a local .env if python-dotenv is available. Optional by design: the
+# game must still start on a machine with nothing installed.
+try:  # pragma: no cover - depends on the deployment environment
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:  # pragma: no cover
+    pass
+
+
+def _env_port(default: int) -> int:
+    """Port from $PORT, which is how PaaS hosts assign one."""
+    raw = os.getenv("PORT")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_host(default: str) -> str:
+    """
+    Bind address.
+
+    When $PORT is set we are almost certainly in a container, where binding to
+    loopback would make the service unreachable from outside it.
+    """
+    explicit = os.getenv("HOST")
+    if explicit:
+        return explicit
+    return "0.0.0.0" if os.getenv("PORT") else default
+
+
+def _env_db() -> str | None:
+    """
+    SQLite path from the environment.
+
+    ``DATABASE_URL`` is accepted for host compatibility. Only SQLite URLs and
+    bare filesystem paths are understood - a postgres:// URL is reported rather
+    than silently ignored, since falling back to a local file would look like
+    data loss.
+    """
+    explicit = os.getenv("NEONRUSH_DB")
+    if explicit:
+        return explicit
+
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        return None
+
+    if url.startswith("sqlite:///"):
+        return url[len("sqlite:///"):]
+    if url.startswith("sqlite://"):
+        return url[len("sqlite://"):]
+    if "://" not in url:
+        return url
+
+    scheme = url.split("://", 1)[0]
+    print(
+        f"error: DATABASE_URL uses '{scheme}://', but this server stores data in "
+        f"SQLite.\n"
+        f"       Set NEONRUSH_DB to a writable file path, or unset DATABASE_URL "
+        f"to use the default.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -35,12 +109,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "phone to play with touch controls."
         ),
     )
-    parser.add_argument("--host", default=config.DEFAULT_HOST,
-                        help=f"bind address (default: {config.DEFAULT_HOST})")
-    parser.add_argument("--port", type=int, default=config.DEFAULT_PORT,
-                        help=f"port; scans upward if busy (default: {config.DEFAULT_PORT})")
+    parser.add_argument("--host", default=None,
+                        help=f"bind address (default: $HOST or {config.DEFAULT_HOST})")
+    parser.add_argument("--port", type=int, default=None,
+                        help=f"port; scans upward if busy (default: $PORT or {config.DEFAULT_PORT})")
     parser.add_argument("--db", default=None,
-                        help=f"SQLite path (default: {config.DEFAULT_DB_PATH})")
+                        help=f"SQLite path (default: $DATABASE_URL or {config.DEFAULT_DB_PATH})")
     parser.add_argument("--no-browser", action="store_true",
                         help="do not auto-open a browser window")
     parser.add_argument("--reset-db", action="store_true",
@@ -53,7 +127,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    db_path = Path(args.db) if args.db else config.DEFAULT_DB_PATH
+    # Explicit flags win over the environment, which wins over the defaults.
+    host = args.host if args.host is not None else _env_host(config.DEFAULT_HOST)
+    port = args.port if args.port is not None else _env_port(config.DEFAULT_PORT)
+    db_setting = args.db or _env_db()
+
+    db_path = Path(db_setting) if db_setting else config.DEFAULT_DB_PATH
     if args.reset_db and db_path.exists():
         # WAL mode leaves sidecar files; remove them too for a clean slate.
         for suffix in ("", "-wal", "-shm"):
@@ -62,15 +141,22 @@ def main(argv: list[str] | None = None) -> int:
                 candidate.unlink()
         print(f"  Removed {db_path}")
 
+    # The parent directory may not exist on a fresh container volume.
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
     if not config.WEB_DIR.is_dir():
         print(f"error: frontend directory missing: {config.WEB_DIR}", file=sys.stderr)
         return 1
 
+    # Never pop a browser in a container: there is none, and the attempt is a
+    # pointless startup delay.
+    open_browser = not args.no_browser and not os.getenv("PORT")
+
     serve(
-        host=args.host,
-        port=args.port,
+        host=host,
+        port=port,
         db_path=str(db_path),
-        open_browser=not args.no_browser,
+        open_browser=open_browser,
         verbose=args.verbose,
     )
     return 0

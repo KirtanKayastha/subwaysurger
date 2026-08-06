@@ -26,7 +26,8 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from . import config
-from .db import Database, now_ms
+from . import passwords
+from .db import Database, NameTakenError, now_ms
 from .validation import RunClaim, validate_run
 
 
@@ -172,8 +173,11 @@ class Api:
         self.add("GET",  "/api/health", self.health)
         self.add("GET",  "/api/config", self.get_config)
         self.add("GET",  "/api/leaderboard", self.get_leaderboard)
+        self.add("GET",  "/api/name-available", self.check_name)
         self.add("GET",  "/api/stats", self.get_stats)
         self.add("POST", "/api/register", self.register)
+        self.add("POST", "/api/claim-name", self.claim_name)
+        self.add("POST", "/api/verify-name", self.verify_name)
         self.add("GET",  "/api/me", self.get_me, auth=True)
         self.add("POST", "/api/me/name", self.set_name, auth=True)
         self.add("POST", "/api/me/progress", self.set_progress, auth=True)
@@ -252,12 +256,108 @@ class Api:
         return ok({"stats": self.db.stats()})
 
     def register(self, request: Request) -> Response:
-        """Create a player and hand back a bearer token (shown once)."""
+        """
+        Claim a display name and hand back a bearer token (shown once).
+
+        There is no password: the token is the credential, stored by the client
+        and never typed by the player. Names are first-come-first-served, so a
+        clash is a normal outcome the UI asks the player to resolve, not an
+        error.
+        """
         name = clean_name(request.body.get("name"))
-        player, token = self.db.create_player(name)
+        try:
+            player, token = self.db.create_player(name)
+        except NameTakenError:
+            return ok({"ok": False, "error": "name_taken", "name": name})
         return ok({
             "token": token,
             "player": self._profile_payload(player),
+        })
+
+    def check_name(self, request: Request) -> Response:
+        """``GET /api/name-available?name=X`` - cheap pre-submit probe."""
+        name = clean_name(request.q("name", ""))
+        existing = self.db.player_by_name(name)
+        return ok({
+            "name": name,
+            "available": existing is None,
+            # Lets the client show a password field labelled correctly before
+            # the player submits: "choose one" vs "enter yours".
+            "hasPassword": bool(existing) and bool(
+                self.db.password_hash_for(existing["id"])
+            ),
+        })
+
+    def claim_name(self, request: Request) -> Response:
+        """
+        ``POST /api/claim-name`` - claim an unused name.
+
+        The password is optional: an empty one creates an account that anyone
+        who knows the name can resume, which is the original behaviour and is
+        fine for a casual score-attack game. Supplying one locks the name to
+        whoever knows it.
+        """
+        name = clean_name(request.body.get("username") or request.body.get("name"))
+        raw = request.body.get("password")
+        password = "" if raw is None else str(raw)
+
+        if password and len(password) < passwords.MIN_PASSWORD_LEN:
+            return ok({
+                "ok": False,
+                "error": "password_too_short",
+                "minLength": passwords.MIN_PASSWORD_LEN,
+            })
+
+        password_hash = passwords.hash_password(password) if password else ""
+        try:
+            player, token = self.db.create_player(name, password_hash)
+        except NameTakenError:
+            return ok({"ok": False, "error": "name_taken", "name": name})
+
+        return ok({
+            "token": token,
+            "player": self._profile_payload(player),
+            "hasPassword": bool(password_hash),
+        })
+
+    def verify_name(self, request: Request) -> Response:
+        """
+        ``POST /api/verify-name`` - sign back in to an existing name.
+
+        Returns a freshly rotated token on success. An unknown name and a wrong
+        password deliberately return the same ``invalid_password`` error, so
+        this endpoint cannot be used to enumerate which names exist.
+        """
+        name = clean_name(request.body.get("username") or request.body.get("name"))
+        raw = request.body.get("password")
+        password = "" if raw is None else str(raw)
+
+        player = self.db.player_by_name(name)
+        if player is None:
+            return ok({"ok": False, "error": "invalid_password"})
+
+        stored = self.db.password_hash_for(player["id"])
+
+        if not stored:
+            # Legacy account with no password. Let the owner set one now rather
+            # than locking them out of progress they already earned.
+            if password:
+                if len(password) < passwords.MIN_PASSWORD_LEN:
+                    return ok({
+                        "ok": False,
+                        "error": "password_too_short",
+                        "minLength": passwords.MIN_PASSWORD_LEN,
+                    })
+                self.db.set_password_hash(player["id"], passwords.hash_password(password))
+        elif not passwords.verify_password(password, stored):
+            return ok({"ok": False, "error": "invalid_password"})
+
+        token = self.db.rotate_token(player["id"])
+        fresh = self.db.player_by_id(player["id"])
+        return ok({
+            "token": token,
+            "player": self._profile_payload(fresh),
+            "hasPassword": True,
         })
 
     # -- authenticated: profile --------------------------------------------
@@ -279,7 +379,14 @@ class Api:
     def set_name(self, request: Request) -> Response:
         player = self._player(request)
         name = clean_name(request.body.get("name"))
-        self.db.rename_player(player["id"], name)
+        try:
+            self.db.rename_player(player["id"], name)
+        except NameTakenError:
+            return ok({
+                "ok": False,
+                "error": "name_taken",
+                "player": self._profile_payload(player),
+            })
         fresh = self.db.player_by_id(player["id"])
         return ok({"player": self._profile_payload(fresh)})
 

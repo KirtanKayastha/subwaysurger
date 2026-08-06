@@ -14,7 +14,7 @@ import { input } from '../engine/input.js';
 import { storage } from '../engine/util.js';
 import { applyRun, blankProgress, loadProgress } from '../missions.js';
 import {
-  Countdown, GameOver, Hud, Leaderboard, MainMenu, PauseMenu, Shop, Toasts,
+  Countdown, GameOver, Hud, Leaderboard, MainMenu, NameGate, PauseMenu, Shop, Toasts,
 } from './components.js';
 
 const { createElement: h, useState, useEffect, useRef, useCallback } = React;
@@ -22,6 +22,7 @@ const { createElement: h, useState, useEffect, useRef, useCallback } = React;
 /** UI screens (distinct from engine states). */
 const SCREEN = {
   LOADING: 'loading',
+  NAME: 'name',
   MENU: 'menu',
   PLAYING: 'playing',
   PAUSED: 'paused',
@@ -46,6 +47,7 @@ export function App() {
   const [runResult, setRunResult] = useState(null);
   const [board, setBoard] = useState({ entries: [], loading: false, window: 'all' });
   const [shopNotice, setShopNotice] = useState('');
+  const [nameNotice, setNameNotice] = useState('');
 
   const gameRef = useRef(null);
   const canvasRef = useRef(null);
@@ -80,13 +82,16 @@ export function App() {
     canvasRef.current = document.getElementById('game');
 
     (async () => {
-      // Connect (or fall back to local storage) and load progression.
+      // Connect and load an existing identity. `null` means this browser has
+      // no player yet, so the name gate is shown before anything else.
       const loaded = await api.init();
       if (cancelled) return;
 
-      setProfile(loaded);
       setOnline(api.online);
-      setProgress(loadProgress(loaded.progress));
+      if (loaded) {
+        setProfile(loaded);
+        setProgress(loadProgress(loaded.progress));
+      }
 
       api.onStatusChange = (value) => setOnline(value);
 
@@ -96,8 +101,10 @@ export function App() {
       // Expose the instance for debugging and the automated smoke test. Read
       // only - nothing in the game reads this back.
       window.__game = game;
-      game.applyUpgrades(loaded.upgrades || {}, api.shop);
-      game.setSkin(loaded.skin || 'cyan');
+      if (loaded) {
+        game.applyUpgrades(loaded.upgrades || {}, api.shop);
+        game.setSkin(loaded.skin || 'cyan');
+      }
       game.renderer.resize();
       game.run();
 
@@ -112,7 +119,7 @@ export function App() {
       };
       input.onMute = () => toggleSound();
 
-      setScreen(SCREEN.MENU);
+      setScreen(loaded ? SCREEN.MENU : SCREEN.NAME);
     })();
 
     return () => {
@@ -358,9 +365,37 @@ export function App() {
     audio.click();
   }, []);
 
+  const claimName = useCallback(async (name, password, existing) => {
+    const outcome = await api.claimName(name, password, existing);
+    if (!outcome.ok) return outcome;
+
+    setProfile(outcome.profile);
+    setProgress(loadProgress(outcome.profile.progress));
+    setOnline(api.online);
+
+    const game = gameRef.current;
+    if (game) {
+      game.applyUpgrades(outcome.profile.upgrades || {}, api.shop);
+      game.setSkin(outcome.profile.skin || 'cyan');
+    }
+
+    audio.click();
+    setScreen(SCREEN.MENU);
+    return outcome;
+  }, []);
+
+  const probeName = useCallback((name) => api.nameAvailable(name), []);
+
   const renamePlayer = useCallback(async (name) => {
-    const updated = await api.setName(name);
-    setProfile(updated);
+    setNameNotice('');
+    const outcome = await api.setName(name);
+    if (!outcome.ok) {
+      audio.deny();
+      setNameNotice(outcome.error === 'name_taken'
+        ? 'THAT NAME IS TAKEN' : 'RENAME FAILED');
+      return;
+    }
+    setProfile(outcome.profile);
     audio.click();
   }, []);
 
@@ -380,7 +415,7 @@ export function App() {
   // Render
   // -------------------------------------------------------------------------
 
-  if (screen === SCREEN.LOADING || !profile) {
+  if (screen === SCREEN.LOADING) {
     return h('div', { className: 'overlay' },
       h('div', { className: 'panel overlay__card' },
         h('h1', { className: 'title' }, 'NEON RUSH'),
@@ -389,10 +424,19 @@ export function App() {
     );
   }
 
+  // Name gate renders before the profile guard: a brand new player has no
+  // profile until they claim a name.
+  if (screen === SCREEN.NAME || !profile) {
+    return h(React.Fragment, null,
+      h(Toasts, { items: toasts }),
+      h(NameGate, { onClaim: claimName, onProbe: probeName, online }),
+    );
+  }
+
   return h(React.Fragment, null,
     // In-run HUD sits under any overlay.
     (screen === SCREEN.PLAYING || screen === SCREEN.PAUSED)
-      ? h(Hud, { hud, best: profile.bestScore })
+      ? h(Hud, { hud, best: profile.bestScore, name: profile.name })
       : null,
 
     countdown > 0 && screen === SCREEN.PLAYING
@@ -403,7 +447,7 @@ export function App() {
 
     screen === SCREEN.MENU
       ? h(MainMenu, {
-          profile, progress, online,
+          profile, progress, online, nameNotice,
           soundOn: settings.sound,
           musicOn: settings.music,
           onPlay: startRun,

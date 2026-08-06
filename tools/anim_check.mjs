@@ -25,6 +25,15 @@ page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 
 await page.goto(BASE, { waitUntil: 'networkidle' });
 await page.waitForFunction(() => !!document.querySelector('.btn--primary'));
+
+// A fresh browser profile lands on the name gate. Claim a throwaway name (no
+// password) so the harness reaches the menu.
+if (await page.locator('text=CHOOSE YOUR NAME').count()) {
+  await page.fill('input[autocomplete="username"]', `AN${Date.now().toString().slice(-6)}`);
+  await page.locator('button[type="submit"]').click();
+  await page.waitForSelector('button:has-text("PLAY")', { timeout: 15000 });
+}
+
 await page.click('.btn--primary');
 await page.waitForFunction(() => !!window.__game);
 

@@ -33,7 +33,7 @@ const ICONS = {
  * Receives an immutable snapshot each animation frame. Every value is
  * pre-computed by the engine so this component stays a pure formatter.
  */
-export const Hud = memo(function Hud({ hud, best }) {
+export const Hud = memo(function Hud({ hud, best, name }) {
   const scoreRef = useRef(null);
   const lastScore = useRef(0);
 
@@ -56,6 +56,7 @@ export const Hud = memo(function Hud({ hud, best }) {
   return h('div', { className: 'hud' },
     h('div', { className: 'hud__top' },
       h('div', { className: 'hud__left' },
+        name ? h('div', { className: 'hud__who' }, 'PLAYING AS ', h('b', null, name)) : null,
         h('div', { className: 'hud__score', ref: scoreRef }, formatNumber(hud.score)),
         h('div', { className: 'hud__sub' },
           h('span', null, formatDistance(hud.distance)),
@@ -118,6 +119,149 @@ export const Hud = memo(function Hud({ hud, best }) {
 });
 
 // ===========================================================================
+// Name gate (first launch)
+// ===========================================================================
+
+/**
+ * First-launch screen: pick a name and a password, then play.
+ *
+ * One form covers both cases. The name is probed as the player leaves the
+ * field, which tells us whether they are claiming a new name or returning to
+ * one; the password field relabels itself accordingly. Claiming with an empty
+ * password is allowed, returning to a protected name is not.
+ *
+ * `onClaim(name, password, existing)` resolves `{ ok, error }`.
+ */
+export function NameGate({ onClaim, onProbe, online }) {
+  const [name, setName] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  // null = not yet probed, true = name already exists, false = free.
+  const [existing, setExisting] = useState(null);
+  const [locked, setLocked] = useState(false);
+
+  const clean = name.trim().toUpperCase().slice(0, 16);
+  const validName = clean.length >= 2;
+  // A protected name cannot be entered without its password.
+  const needsPassword = existing === true && locked;
+  const validPassword = !needsPassword || password.length >= 4;
+  const canSubmit = validName && validPassword && !busy;
+
+  const probe = async () => {
+    if (!validName || !onProbe) return;
+    const result = await onProbe(clean);
+    if (!result.ok) return;
+    setExisting(!result.available);
+    setLocked(!!result.hasPassword);
+  };
+
+  const submit = async (event) => {
+    if (event) event.preventDefault();
+    if (!canSubmit) return;
+    setBusy(true);
+    setError('');
+
+    // Probed state decides the endpoint. When the probe never ran (offline,
+    // or the player hit enter immediately) treat it as a claim and let the
+    // server correct us via name_taken.
+    const outcome = await onClaim(clean, password, existing === true);
+
+    if (!outcome.ok) {
+      if (outcome.error === 'invalid_password') {
+        setError('INVALID PASSWORD');
+        setExisting(true);
+        setLocked(true);
+      } else if (outcome.error === 'name_taken') {
+        // Claim raced with someone else, or the probe was stale. Switch the
+        // form to sign-in rather than making the player retype the name.
+        setError('THAT NAME IS TAKEN - ENTER ITS PASSWORD OR PICK ANOTHER');
+        setExisting(true);
+        setLocked(true);
+      } else if (outcome.error === 'password_too_short') {
+        setError('PASSWORD MUST BE AT LEAST 4 CHARACTERS');
+      } else {
+        setError('COULD NOT START - TRY AGAIN');
+      }
+      setBusy(false);
+    }
+    // On success the screen unmounts.
+  };
+
+  const passwordLabel = existing === true
+    ? 'PASSWORD'
+    : 'PASSWORD (OPTIONAL)';
+
+  return h('div', { className: 'overlay' },
+    h('form', { className: 'panel overlay__card', onSubmit: submit },
+      h('h1', { className: 'title' }, 'NEON RUSH'),
+      h('p', { className: 'title__sub' }, 'ENDLESS SUBWAY RUNNER'),
+
+      h('p', { className: 'gate__prompt' },
+        existing === true ? 'WELCOME BACK' : 'CHOOSE YOUR NAME'),
+
+      h('div', { className: 'field field--gate' },
+        h('input', {
+          value: name,
+          autoFocus: true,
+          maxLength: 16,
+          disabled: busy,
+          placeholder: 'USERNAME',
+          'aria-label': 'Username',
+          autoComplete: 'username',
+          autoCorrect: 'off',
+          spellCheck: false,
+          onChange: (event) => {
+            setName(event.target.value);
+            setError('');
+            // Any edit invalidates the previous probe.
+            setExisting(null);
+            setLocked(false);
+          },
+          onBlur: probe,
+        }),
+      ),
+
+      h('div', { className: 'field field--gate' },
+        h('input', {
+          value: password,
+          type: 'password',
+          maxLength: 72,
+          disabled: busy,
+          placeholder: passwordLabel,
+          'aria-label': passwordLabel,
+          autoComplete: existing === true ? 'current-password' : 'new-password',
+          onChange: (event) => { setPassword(event.target.value); setError(''); },
+        }),
+      ),
+
+      error
+        ? h('div', { className: 'badge badge--warn', style: { marginBottom: '10px' } }, error)
+        : null,
+
+      h('div', { className: 'actions' },
+        h('button', {
+          className: 'btn btn--primary',
+          type: 'submit',
+          disabled: !canSubmit,
+        }, busy ? (existing === true ? 'SIGNING IN...' : 'STARTING...')
+                : (existing === true ? 'SIGN IN' : 'START')),
+      ),
+
+      h('p', { className: 'gate__note' },
+        !validName ? 'AT LEAST 2 CHARACTERS'
+          : needsPassword ? 'THIS NAME IS PROTECTED - ENTER ITS PASSWORD'
+          : existing === true ? 'SIGNING BACK IN TO THIS NAME'
+          : 'A PASSWORD KEEPS THIS NAME YOURS'),
+
+      !online
+        ? h('p', { className: 'gate__note' }, 'OFFLINE - SAVED ON THIS DEVICE')
+        : null,
+    ),
+  );
+}
+
+// ===========================================================================
 // Toasts
 // ===========================================================================
 
@@ -173,7 +317,7 @@ function Tabs({ tabs, active, onChange }) {
 
 export function MainMenu({
   profile, progress, onPlay, onShop, onLeaderboard, onRename,
-  soundOn, musicOn, onToggleSound, onToggleMusic, online,
+  soundOn, musicOn, onToggleSound, onToggleMusic, online, nameNotice,
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(profile.name || 'RUNNER');
@@ -216,6 +360,10 @@ export function MainMenu({
               title: 'Change your name',
             }, `${profile.name}  [edit]`),
           ),
+
+      nameNotice
+        ? h('div', { className: 'badge badge--warn', style: { marginBottom: '10px' } }, nameNotice)
+        : null,
 
       // --- stat summary ---
       h('div', { className: 'results' },

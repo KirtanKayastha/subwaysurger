@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from server.app import config
 from server.app.api import Api, Request, clean_name
-from server.app.db import Database
+from server.app.db import Database, NameTakenError
 from server.app.validation import RunClaim, validate_run
 
 
@@ -219,6 +219,134 @@ class DatabaseTests(unittest.TestCase):
     def test_consume_never_goes_negative(self):
         player, _ = self.db.create_player("C")
         self.assertEqual(self.db.consume_upgrade(player["id"], "hoverboard", 5), 0)
+
+
+class UniqueNameTests(unittest.TestCase):
+    """
+    Names are claimed first-come-first-served and must be unique, since the
+    leaderboard identifies players by name alone. There is no password: the
+    bearer token proves ownership, uniqueness only prevents impersonation.
+    """
+
+    def setUp(self):
+        self.db = Database(":memory:")
+        self.api = Api(self.db)
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_second_claim_of_same_name_is_refused(self):
+        status, first = call(self.api, "POST", "/api/register", {"name": "ACE"})
+        self.assertEqual(status, 200)
+        self.assertIn("token", first)
+
+        status, second = call(self.api, "POST", "/api/register", {"name": "ACE"})
+        self.assertEqual(status, 200)
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["error"], "name_taken")
+        self.assertNotIn("token", second)
+
+    def test_uniqueness_is_case_insensitive(self):
+        call(self.api, "POST", "/api/register", {"name": "ACE"})
+        _, clash = call(self.api, "POST", "/api/register", {"name": "ace"})
+        self.assertEqual(clash["error"], "name_taken")
+
+    def test_availability_probe(self):
+        _, free = call(self.api, "GET", "/api/name-available", query={"name": ["GHOST"]})
+        self.assertTrue(free["available"])
+        call(self.api, "POST", "/api/register", {"name": "GHOST"})
+        _, taken = call(self.api, "GET", "/api/name-available", query={"name": ["GHOST"]})
+        self.assertFalse(taken["available"])
+
+    def test_rename_onto_taken_name_is_refused(self):
+        call(self.api, "POST", "/api/register", {"name": "ALPHA"})
+        _, mine = call(self.api, "POST", "/api/register", {"name": "BETA"})
+        token = mine["token"]
+
+        _, refused = call(self.api, "POST", "/api/me/name", {"name": "ALPHA"}, token)
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["error"], "name_taken")
+        # The original name must survive a refused rename.
+        _, me = call(self.api, "GET", "/api/me", token=token)
+        self.assertEqual(me["player"]["name"], "BETA")
+
+    def test_rename_to_own_name_is_allowed(self):
+        _, mine = call(self.api, "POST", "/api/register", {"name": "SOLO"})
+        _, again = call(self.api, "POST", "/api/me/name", {"name": "SOLO"}, mine["token"])
+        self.assertNotIn("error", again)
+
+    def test_db_raises_on_duplicate(self):
+        self.db.create_player("DUPE")
+        with self.assertRaises(NameTakenError):
+            self.db.create_player("DUPE")
+
+
+class NameMigrationTests(unittest.TestCase):
+    """
+    Databases created before names were unique contain many players sharing the
+    default name. The migration must resolve those before it can build the
+    unique index, or the server would fail to start.
+    """
+
+    def test_existing_duplicates_are_deduped(self):
+        db = Database(":memory:")
+        try:
+            # Simulate a pre-migration database: drop the index, then insert
+            # colliding names directly.
+            with db.tx() as conn:
+                conn.execute("DROP INDEX IF EXISTS idx_players_name_unique")
+                ts = 1
+                for i in range(3):
+                    conn.execute(
+                        "INSERT INTO players (public_id, token_hash, name, "
+                        "created_ms, updated_ms) VALUES (?,?,?,?,?)",
+                        (f"pub{i}", f"hash{i}", "RUNNER", ts + i, ts + i),
+                    )
+
+            db._migrate_unique_names()
+
+            names = [r["name"] for r in db.query("SELECT name FROM players ORDER BY id")]
+            self.assertEqual(len(names), len(set(n.lower() for n in names)))
+            # Oldest keeps the bare name.
+            self.assertEqual(names[0], "RUNNER")
+            # And the index now exists, so further duplicates are impossible.
+            with self.assertRaises(NameTakenError):
+                db.create_player("RUNNER")
+        finally:
+            db.close()
+
+    def test_migration_is_idempotent(self):
+        db = Database(":memory:")
+        try:
+            db._migrate_unique_names()
+            db._migrate_unique_names()
+            db.create_player("ONLY")
+            self.assertTrue(db.name_taken("only"))
+        finally:
+            db.close()
+
+
+class LeaderboardSizeTests(unittest.TestCase):
+    def test_returns_up_to_one_hundred(self):
+        db = Database(":memory:")
+        api = Api(db)
+        try:
+            for i in range(105):
+                player, _ = db.create_player(f"P{i:03d}")
+                db.record_score(
+                    player["id"], score=i, coins=0, distance=10,
+                    duration_ms=1000, best_combo=0, coins_banked=0,
+                )
+            # Query values arrive as lists, matching urllib's parse_qs.
+            _, data = call(api, "GET", "/api/leaderboard", query={"limit": ["100"]})
+            self.assertEqual(len(data["entries"]), 100)
+            # Highest score first.
+            self.assertEqual(data["entries"][0]["score"], 104)
+            # And the cap holds even if a client asks for more.
+            _, big = call(api, "GET", "/api/leaderboard", query={"limit": ["5000"]})
+            self.assertLessEqual(len(big["entries"]), 100)
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

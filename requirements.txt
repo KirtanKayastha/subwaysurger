@@ -1,0 +1,14 @@
+# NEON RUSH - Python dependencies.
+#
+# The game deliberately runs on the standard library alone: `python run.py` on
+# a clean machine with nothing installed will work. Everything below is an
+# optional upgrade for deployed environments, and the code degrades gracefully
+# when any of it is absent.
+
+# Stronger password hashing. Without it the server falls back to stdlib scrypt,
+# which is still a sound choice; bcrypt is listed because it is the more widely
+# audited default.
+bcrypt>=4.1.2
+
+# Loads a local .env during development. Ignored when not installed.
+python-dotenv>=1.0.1

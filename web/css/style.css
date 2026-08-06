@@ -211,6 +211,17 @@ button { font-family: inherit; color: inherit; }
 }
 .hud__best { color: var(--text-faint); }
 
+/* "PLAYING AS <name>", sits above the score in the top-left. */
+.hud__who {
+  font-size: 11px; font-weight: 600; letter-spacing: .16em;
+  color: var(--text-faint); text-transform: uppercase;
+  text-shadow: 0 2px 6px rgba(0,0,0,.8);
+}
+.hud__who b {
+  color: var(--cyan); font-weight: 800; margin-left: 4px;
+  text-shadow: 0 0 12px rgba(34, 232, 255, .55);
+}
+
 .hud__coins {
   display: flex; align-items: center; gap: 7px;
   font-size: clamp(17px, 3.6vw, 22px); font-weight: 800; color: var(--gold);
@@ -469,6 +480,19 @@ button { font-family: inherit; color: inherit; }
   letter-spacing: .1em; text-transform: uppercase; text-align: center;
 }
 .field input:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(34,232,255,.16); }
+.field input:disabled { opacity: .55; cursor: progress; }
+
+/* --- name gate --- */
+.field--gate { flex-direction: column; margin-bottom: 10px; }
+.field--gate input { width: 100%; font-size: 19px; letter-spacing: .18em; }
+.gate__prompt {
+  font-size: 12px; font-weight: 700; letter-spacing: .18em;
+  color: var(--text-dim); text-transform: uppercase; margin: 6px 0 2px;
+}
+.gate__note {
+  font-size: 11px; letter-spacing: .1em; line-height: 1.5;
+  color: var(--text-faint); text-transform: uppercase; margin: 12px 0 0;
+}
 
 /* --- missions --- */
 .missions { display: flex; flex-direction: column; gap: 8px; }

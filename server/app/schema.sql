@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS players (
     public_id    TEXT    NOT NULL UNIQUE,   -- opaque id shared with clients
     token_hash   TEXT    NOT NULL UNIQUE,   -- sha256(bearer token)
     name         TEXT    NOT NULL,
+    password_hash TEXT   NOT NULL DEFAULT '', -- '' = legacy, no password set
     coins        INTEGER NOT NULL DEFAULT 0,     -- banked, spendable currency
     total_coins  INTEGER NOT NULL DEFAULT 0,     -- lifetime collected
     best_score   INTEGER NOT NULL DEFAULT 0,
@@ -30,6 +31,11 @@ CREATE TABLE IF NOT EXISTS players (
 );
 
 CREATE INDEX IF NOT EXISTS idx_players_best ON players(best_score DESC);
+
+-- NOTE: display names are also UNIQUE (case-insensitively), but that index is
+-- created by Database._migrate_unique_names() rather than here. Existing
+-- databases predate the constraint and contain duplicate default names, so the
+-- duplicates must be resolved before the index can be built.
 
 -- Purchased upgrade tiers / consumable stock, one row per (player, item).
 CREATE TABLE IF NOT EXISTS upgrades (

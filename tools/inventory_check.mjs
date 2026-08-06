@@ -34,6 +34,21 @@ const readStock = (page) => page.evaluate(() => {
 const waitForMenu = (page) =>
   page.waitForFunction(() => !!document.querySelector('#ui-root .btn--primary'), { timeout: 15000 });
 
+/**
+ * Claim a name if the gate is showing.
+ *
+ * A fresh browser profile must choose a unique name before it can play, so
+ * every test that starts from a clean context has to pass through this.
+ */
+async function claimName(page) {
+  if (!(await page.locator('text=CHOOSE YOUR NAME').count())) return null;
+  const name = `I${Date.now().toString().slice(-7)}`.slice(0, 16);
+  await page.fill('input', name);
+  await page.locator('button:has-text("START")').click();
+  await page.waitForSelector('button:has-text("PLAY")', { timeout: 15000 });
+  return name;
+}
+
 const browser = await chromium.launch();
 const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
 const page = await context.newPage();
@@ -45,6 +60,7 @@ page.on('console', (msg) => {
 
 await page.goto(BASE, { waitUntil: 'networkidle' });
 await waitForMenu(page);
+log('claimed name:', await claimName(page));
 
 // --- grant coins so the shop is usable --------------------------------------
 // The server is authoritative when it is up, so writing coins into

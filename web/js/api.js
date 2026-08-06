@@ -68,7 +68,10 @@ export function priceFor(item, level) {
 /** Shape of a fresh local profile. */
 function blankProfile() {
   return {
-    name: 'RUNNER',
+    name: '',
+    // False until the player has chosen a name. Gates the start screen, and
+    // is what distinguishes "new player" from "player called RUNNER".
+    claimed: false,
     coins: 0,
     totalCoins: 0,
     bestScore: 0,
@@ -156,8 +159,11 @@ export class ApiClient {
   // -------------------------------------------------------------------------
 
   /**
-   * Connect, registering a player if this browser has no token yet.
-   * Always resolves with a usable profile.
+   * Connect and load the existing identity, if this browser has one.
+   *
+   * Deliberately does NOT create a player: a name is claimed explicitly by the
+   * player on the start screen, via `claimName`. Resolves to a profile for a
+   * returning player, or `null` when a name still needs to be chosen.
    */
   async init() {
     const health = await this._request('/api/health', { auth: false });
@@ -170,31 +176,89 @@ export class ApiClient {
       }
 
       // Existing token: fetch the profile. A 401 means the DB was reset, so
-      // fall through and register again.
+      // drop the token and fall through to the name prompt.
       if (this.token) {
         const me = await this._request('/api/me');
         if (me && me.ok && me.player) {
-          this._cacheProfile(me.player);
-          return me.player;
+          const player = { ...me.player, claimed: true };
+          this._cacheProfile(player);
+          return player;
         }
         this.token = null;
         storage.remove(STORAGE_KEYS.token);
       }
-
-      const local = this._localProfile();
-      const registered = await this._request('/api/register', {
-        method: 'POST', auth: false, body: { name: local.name },
-      });
-      if (registered && registered.ok) {
-        this.token = registered.token;
-        storage.set(STORAGE_KEYS.token, this.token);
-        this._cacheProfile(registered.player);
-        return registered.player;
-      }
+      return null;
     }
 
-    // Offline: hand back the local mirror.
-    return this._localProfile();
+    // Offline: reuse a locally-claimed name, otherwise prompt for one.
+    const local = this._localProfile();
+    return local.claimed && local.name ? local : null;
+  }
+
+  /**
+   * Claim a new name, or sign back in to an existing one.
+   *
+   * `existing` picks the endpoint: claiming requires the name to be free,
+   * verifying requires the password to match. Both return a bearer token that
+   * the client stores and uses from then on, so the password is typed once per
+   * device and never held in memory afterwards.
+   *
+   * @returns {Promise<{ok:boolean, error?:string, profile?:object}>}
+   */
+  async claimName(name, password = '', existing = false) {
+    const clean = String(name || '').trim().slice(0, 16).toUpperCase();
+    if (!clean) return { ok: false, error: 'empty_name' };
+
+    const path = existing ? '/api/verify-name' : '/api/claim-name';
+    const response = await this._request(path, {
+      method: 'POST', auth: false,
+      body: { username: clean, password: String(password || '') },
+    });
+
+    if (response && response.ok === false) {
+      return { ok: false, error: response.error || 'failed' };
+    }
+
+    if (response && response.ok && response.token) {
+      this.token = response.token;
+      storage.set(STORAGE_KEYS.token, this.token);
+      const player = { ...response.player, claimed: true };
+      this._cacheProfile(player);
+      return { ok: true, profile: player };
+    }
+
+    // Offline: no server to claim against, so keep the name locally. Passwords
+    // are not verifiable offline, so they are simply not stored.
+    const profile = this._saveLocal((p) => {
+      p.name = clean;
+      p.claimed = true;
+    });
+    return { ok: true, profile, offline: true };
+  }
+
+  /**
+   * Probe a name before submitting.
+   *
+   * `hasPassword` lets the gate label its password field correctly - "choose
+   * one" for a free name, "enter yours" for a protected one - before the
+   * player commits to a submit.
+   */
+  async nameAvailable(name) {
+    const clean = String(name || '').trim().slice(0, 16).toUpperCase();
+    if (!clean) return { ok: false, available: false, hasPassword: false };
+    const response = await this._request(
+      `/api/name-available?name=${encodeURIComponent(clean)}`,
+      { auth: false },
+    );
+    // Unknown offline - treat as available rather than blocking the player.
+    if (!response || !response.ok) {
+      return { ok: false, available: true, hasPassword: false };
+    }
+    return {
+      ok: true,
+      available: !!response.available,
+      hasPassword: !!response.hasPassword,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -312,7 +376,7 @@ export class ApiClient {
   // Leaderboard
   // -------------------------------------------------------------------------
 
-  async leaderboard(window = 'all', limit = 20) {
+  async leaderboard(window = 'all', limit = 100) {
     const response = await this._request(
       `/api/leaderboard?window=${encodeURIComponent(window)}&limit=${limit}`,
       { auth: false },
@@ -335,18 +399,32 @@ export class ApiClient {
   // Profile & shop
   // -------------------------------------------------------------------------
 
+  /**
+   * Rename the player.
+   *
+   * Unlike the other writes this does NOT save locally first: the name must be
+   * unique, so the server has to accept it before we can treat it as ours.
+   * @returns {Promise<{ok:boolean, error?:string, profile:object}>}
+   */
   async setName(name) {
     const clean = String(name || '').trim().slice(0, 16).toUpperCase() || 'RUNNER';
-    this._saveLocal((profile) => { profile.name = clean; });
 
     const response = await this._request('/api/me/name', {
       method: 'POST', body: { name: clean },
     });
-    if (response && response.ok && response.player) {
-      this._cacheProfile(response.player);
-      return response.player;
+
+    if (response && response.ok === false && response.error === 'name_taken') {
+      return { ok: false, error: 'name_taken', profile: this._localProfile() };
     }
-    return this._localProfile();
+    if (response && response.ok && response.player) {
+      const player = { ...response.player, claimed: true };
+      this._cacheProfile(player);
+      return { ok: true, profile: player };
+    }
+
+    // Offline: nobody to clash with, so accept it locally.
+    const profile = this._saveLocal((p) => { p.name = clean; p.claimed = true; });
+    return { ok: true, profile, offline: true };
   }
 
   /**

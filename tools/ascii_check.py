@@ -14,8 +14,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Directories that are never rewritten (third-party / generated).
-SKIP_PARTS = {"vendor", "data", "__pycache__", ".git", "node_modules"}
+# Directories that are never rewritten (third-party / generated / virtualenvs).
+SKIP_PARTS = {
+    "vendor", "data", "__pycache__", ".git", "node_modules",
+    ".venv", "venv", "env", "site-packages", ".mypy_cache", ".pytest_cache",
+}
 
 EXTENSIONS = {".js", ".css", ".html", ".py", ".sql", ".md"}
 
