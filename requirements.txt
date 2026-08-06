@@ -12,3 +12,9 @@ bcrypt>=4.1.2
 
 # Loads a local .env during development. Ignored when not installed.
 python-dotenv>=1.0.1
+flask
+flask-cors
+bcrypt>=4.1.2
+pyjwt>=2.4.0
+python-dotenv>=1.0.1
+psycopg2-binary>=2.9.0
