@@ -8,26 +8,36 @@
 --  * `scores` is append-only: it is the authoritative run history. The
 --    leaderboard is a query over it rather than a mutable table, which keeps
 --    ranking honest and lets us recompute at any time.
+--  * BIGINT, not INTEGER, for every millisecond timestamp and every running
+--    total. SQLite stores all integers as 64-bit so the distinction is
+--    invisible there, but PostgreSQL INTEGER is int4 with a ceiling of
+--    2_147_483_647 - three orders of magnitude below an epoch-millisecond
+--    value (~1.8e12). Declaring these INTEGER makes CREATE TABLE succeed and
+--    then every INSERT fail with "integer out of range", which is why
+--    registration returned a 500 while /api/health looked healthy.
 
 PRAGMA foreign_keys = ON;
 
 -- Registered players. A "player" is created transparently on first launch.
+-- `id` must stay spelled `INTEGER PRIMARY KEY AUTOINCREMENT`: SQLite only
+-- treats that exact phrase as a rowid alias. driver.to_postgres() rewrites it
+-- to BIGSERIAL PRIMARY KEY.
 CREATE TABLE IF NOT EXISTS players (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     public_id    TEXT    NOT NULL UNIQUE,   -- opaque id shared with clients
     token_hash   TEXT    NOT NULL UNIQUE,   -- sha256(bearer token)
     name         TEXT    NOT NULL,
     password_hash TEXT   NOT NULL DEFAULT '', -- '' = legacy, no password set
-    coins        INTEGER NOT NULL DEFAULT 0,     -- banked, spendable currency
-    total_coins  INTEGER NOT NULL DEFAULT 0,     -- lifetime collected
-    best_score   INTEGER NOT NULL DEFAULT 0,
+    coins        BIGINT  NOT NULL DEFAULT 0,     -- banked, spendable currency
+    total_coins  BIGINT  NOT NULL DEFAULT 0,     -- lifetime collected
+    best_score   BIGINT  NOT NULL DEFAULT 0,
     best_distance REAL   NOT NULL DEFAULT 0,
-    runs         INTEGER NOT NULL DEFAULT 0,
-    play_ms      INTEGER NOT NULL DEFAULT 0,
+    runs         BIGINT  NOT NULL DEFAULT 0,
+    play_ms      BIGINT  NOT NULL DEFAULT 0,
     skin         TEXT    NOT NULL DEFAULT 'cyan',
     progress     TEXT    NOT NULL DEFAULT '{}', -- opaque client blob (missions etc.)
-    created_ms   INTEGER NOT NULL,
-    updated_ms   INTEGER NOT NULL
+    created_ms   BIGINT  NOT NULL,
+    updated_ms   BIGINT  NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_players_best ON players(best_score DESC);
@@ -39,18 +49,18 @@ CREATE INDEX IF NOT EXISTS idx_players_best ON players(best_score DESC);
 
 -- Purchased upgrade tiers / consumable stock, one row per (player, item).
 CREATE TABLE IF NOT EXISTS upgrades (
-    player_id  INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    player_id  BIGINT  NOT NULL REFERENCES players(id) ON DELETE CASCADE,
     item_id    TEXT    NOT NULL,
-    level      INTEGER NOT NULL DEFAULT 0,
-    updated_ms INTEGER NOT NULL,
+    level      BIGINT  NOT NULL DEFAULT 0,
+    updated_ms BIGINT  NOT NULL,
     PRIMARY KEY (player_id, item_id)
 );
 
 -- Cosmetic skins the player owns.
 CREATE TABLE IF NOT EXISTS skins (
-    player_id  INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    player_id  BIGINT  NOT NULL REFERENCES players(id) ON DELETE CASCADE,
     skin_id    TEXT    NOT NULL,
-    created_ms INTEGER NOT NULL,
+    created_ms BIGINT  NOT NULL,
     PRIMARY KEY (player_id, skin_id)
 );
 
@@ -59,10 +69,10 @@ CREATE TABLE IF NOT EXISTS skins (
 -- duration against real wall-clock time.
 CREATE TABLE IF NOT EXISTS runs (
     token      TEXT    PRIMARY KEY,
-    player_id  INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
-    started_ms INTEGER NOT NULL,
-    used_ms    INTEGER,                     -- NULL until redeemed
-    seed       INTEGER NOT NULL             -- level seed handed to the client
+    player_id  BIGINT  NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    started_ms BIGINT  NOT NULL,
+    used_ms    BIGINT,                      -- NULL until redeemed
+    seed       BIGINT  NOT NULL             -- level seed handed to the client
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_ms);
@@ -70,14 +80,14 @@ CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_ms);
 -- Append-only run results.
 CREATE TABLE IF NOT EXISTS scores (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    player_id   INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+    player_id   BIGINT  NOT NULL REFERENCES players(id) ON DELETE CASCADE,
     name        TEXT    NOT NULL,           -- denormalised for fast boards
-    score       INTEGER NOT NULL,
-    coins       INTEGER NOT NULL,
+    score       BIGINT  NOT NULL,
+    coins       BIGINT  NOT NULL,
     distance    REAL    NOT NULL,
-    duration_ms INTEGER NOT NULL,
-    best_combo  INTEGER NOT NULL DEFAULT 0,
-    created_ms  INTEGER NOT NULL
+    duration_ms BIGINT  NOT NULL,
+    best_combo  BIGINT  NOT NULL DEFAULT 0,
+    created_ms  BIGINT  NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_scores_score   ON scores(score DESC, created_ms ASC);

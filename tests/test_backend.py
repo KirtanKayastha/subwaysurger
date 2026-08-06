@@ -6,6 +6,7 @@ Backend test suite (stdlib unittest, no dependencies).
 
 from __future__ import annotations
 
+import re
 import sys
 import time
 import unittest
@@ -15,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from server.app import config
 from server.app.api import Api, Request, clean_name
-from server.app.db import Database, NameTakenError
+from server.app.db import Database, NameTakenError, _BIGINT_COLUMNS, now_ms
+from server.app.driver import strip_pragmas, to_postgres
 from server.app.validation import RunClaim, validate_run
 
 
@@ -345,6 +347,157 @@ class LeaderboardSizeTests(unittest.TestCase):
             # And the cap holds even if a client asks for more.
             _, big = call(api, "GET", "/api/leaderboard", query={"limit": ["5000"]})
             self.assertLessEqual(len(big["entries"]), 100)
+        finally:
+            db.close()
+
+
+class PostgresDialectTests(unittest.TestCase):
+    """
+    Guards the SQLite -> PostgreSQL translation.
+
+    These are pure string/schema assertions rather than live queries: CI has no
+    PostgreSQL server, and the bug being guarded against is entirely a matter of
+    which type name the schema emits.
+    """
+
+    def _pg_schema(self):
+        raw = (
+            Path(__file__).resolve().parents[1]
+            / "server" / "app" / "schema.sql"
+        ).read_text(encoding="utf-8")
+        return to_postgres(strip_pragmas(raw))
+
+    def test_no_bare_integer_columns(self):
+        """
+        Epoch-millisecond values overflow PostgreSQL's 4-byte INTEGER.
+
+        now_ms() is ~1.8e12 against an int4 ceiling of 2_147_483_647, so any
+        column declared INTEGER makes CREATE TABLE succeed and every INSERT
+        fail with "integer out of range" - the 500 on /api/claim-name. SQLite
+        stores all integers as 64-bit, so only PostgreSQL is affected.
+        """
+        self.assertGreater(now_ms(), 2 ** 31 - 1)
+
+        offenders = [
+            line.strip()
+            for line in self._pg_schema().splitlines()
+            if re.search(r"\bINTEGER\b", line, re.I)
+            and not line.strip().startswith("--")
+        ]
+        self.assertEqual(offenders, [], f"int4 columns in PG schema: {offenders}")
+
+    def test_autoincrement_becomes_bigserial(self):
+        """BIGSERIAL, not SERIAL, so ids match the BIGINT foreign keys."""
+        pg = self._pg_schema()
+        self.assertIn("BIGSERIAL PRIMARY KEY", pg)
+        self.assertNotIn("AUTOINCREMENT", pg)
+        self.assertFalse(re.search(r"(?<!BIG)SERIAL PRIMARY KEY", pg))
+
+    def test_migration_list_matches_schema(self):
+        """
+        Every BIGINT column in schema.sql must be in _BIGINT_COLUMNS.
+
+        schema.sql only governs databases being created for the first time;
+        CREATE TABLE IF NOT EXISTS leaves an existing deployment untouched. The
+        migration list is what repairs those, so the two must not drift apart.
+        """
+        raw = (
+            Path(__file__).resolve().parents[1]
+            / "server" / "app" / "schema.sql"
+        ).read_text(encoding="utf-8")
+
+        declared, table = set(), None
+        for line in raw.splitlines():
+            created = re.match(r"\s*CREATE TABLE IF NOT EXISTS (\w+)", line)
+            if created:
+                table = created.group(1)
+                continue
+            column = re.match(r"\s*(\w+)\s+BIGINT\b", line, re.I)
+            if column and table:
+                declared.add((table, column.group(1)))
+
+        self.assertTrue(declared, "schema.sql declared no BIGINT columns")
+        self.assertEqual(declared, set(_BIGINT_COLUMNS))
+
+    def test_widen_migration_is_noop_on_sqlite(self):
+        """SQLite integers are already 64-bit; the migration must skip it."""
+        db = Database(":memory:")
+        try:
+            self.assertFalse(db.postgres)
+            db._migrate_widen_integers()  # must not raise
+            player, _ = db.create_player("BIGTS")
+            self.assertGreater(player["createdMs"], 2 ** 31 - 1)
+        finally:
+            db.close()
+
+
+class LeaderboardShapeTests(unittest.TestCase):
+    def test_one_row_per_player_from_a_single_run(self):
+        """
+        Each player appears once, showing their best run intact.
+
+        MAX(score) and MAX(distance) are independent aggregates, so the old
+        GROUP BY could pair a player's best score with the distance of an
+        entirely different run. ALICE's best score comes from her *shortest*
+        run, which makes that mismatch observable.
+        """
+        db = Database(":memory:")
+        try:
+            alice, _ = db.create_player("ALICE")
+            bob, _ = db.create_player("BOB")
+
+            for score, distance in ((500, 9000.0), (2000, 300.0), (700, 1200.0)):
+                db.record_score(
+                    alice["id"], score=score, coins=0, distance=distance,
+                    duration_ms=30000, best_combo=0, coins_banked=0,
+                )
+            db.record_score(
+                bob["id"], score=1500, coins=0, distance=600.0,
+                duration_ms=30000, best_combo=0, coins_banked=0,
+            )
+
+            board = db.leaderboard(limit=50)
+            self.assertEqual([e["name"] for e in board], ["ALICE", "BOB"])
+            self.assertEqual([e["score"] for e in board], [2000, 1500])
+            # The distance must come from the same row as the score.
+            self.assertEqual(board[0]["distance"], 300.0)
+
+        finally:
+            db.close()
+
+    def test_rename_does_not_split_a_player(self):
+        """Grouping is by player_id, so stale score-row names cannot split."""
+        db = Database(":memory:")
+        try:
+            player, _ = db.create_player("OLDNAME")
+            db.record_score(
+                player["id"], score=100, coins=0, distance=10.0,
+                duration_ms=5000, best_combo=0, coins_banked=0,
+            )
+            db.rename_player(player["id"], "NEWNAME")
+            db.record_score(
+                player["id"], score=900, coins=0, distance=20.0,
+                duration_ms=5000, best_combo=0, coins_banked=0,
+            )
+
+            board = db.leaderboard(limit=50)
+            self.assertEqual(len(board), 1)
+            self.assertEqual(board[0]["score"], 900)
+        finally:
+            db.close()
+
+    def test_runs_mode_still_lists_every_run(self):
+        """mode=runs is unchanged: one row per run, not per player."""
+        db = Database(":memory:")
+        try:
+            player, _ = db.create_player("MULTI")
+            for score in (10, 20, 30):
+                db.record_score(
+                    player["id"], score=score, coins=0, distance=5.0,
+                    duration_ms=5000, best_combo=0, coins_banked=0,
+                )
+            self.assertEqual(len(db.leaderboard(50, best_per_player=False)), 3)
+            self.assertEqual(len(db.leaderboard(50, best_per_player=True)), 1)
         finally:
             db.close()
 

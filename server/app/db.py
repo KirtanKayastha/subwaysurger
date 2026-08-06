@@ -35,7 +35,44 @@ from typing import Any, Iterable, Iterator, Optional
 from . import config
 from . import driver
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
+
+#: Columns that must hold 64-bit values, as ``(table, column)``.
+#:
+#: Epoch-millisecond timestamps (~1.8e12) and lifetime counters both overflow
+#: PostgreSQL's 4-byte INTEGER, whose ceiling is 2_147_483_647. schema.sql now
+#: declares them BIGINT, but that only helps a database being created for the
+#: first time - see :meth:`Database._migrate_widen_integers`.
+#:
+#: Primary keys are deliberately absent. Widening a column that a foreign key
+#: references forces PostgreSQL to revalidate the constraint, and an int8
+#: foreign key referencing an int4 key is legal anyway, so leaving the existing
+#: SERIAL columns alone is the lower-risk choice. Fresh databases get BIGSERIAL
+#: from the schema regardless.
+_BIGINT_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("players", "coins"),
+    ("players", "total_coins"),
+    ("players", "best_score"),
+    ("players", "runs"),
+    ("players", "play_ms"),
+    ("players", "created_ms"),
+    ("players", "updated_ms"),
+    ("upgrades", "player_id"),
+    ("upgrades", "level"),
+    ("upgrades", "updated_ms"),
+    ("skins", "player_id"),
+    ("skins", "created_ms"),
+    ("runs", "player_id"),
+    ("runs", "started_ms"),
+    ("runs", "used_ms"),
+    ("runs", "seed"),
+    ("scores", "player_id"),
+    ("scores", "score"),
+    ("scores", "coins"),
+    ("scores", "duration_ms"),
+    ("scores", "best_combo"),
+    ("scores", "created_ms"),
+)
 
 
 class NameTakenError(Exception):
@@ -167,8 +204,50 @@ class Database:
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (SCHEMA_VERSION,),
             )
+        self._migrate_widen_integers()
         self._migrate_unique_names()
         self._migrate_password_column()
+
+    def _migrate_widen_integers(self) -> None:
+        """
+        Widen 4-byte INTEGER columns to BIGINT on PostgreSQL.
+
+        schema.sql declares every timestamp and counter BIGINT, but
+        ``CREATE TABLE IF NOT EXISTS`` leaves an already-existing table exactly
+        as it found it. A deployment created before that fix therefore still
+        has int4 ``created_ms`` / ``updated_ms`` columns, so every INSERT of an
+        epoch-millisecond value (~1.8e12 against a 2_147_483_647 ceiling) fails
+        with ``integer out of range``. That is the 500 on ``/api/claim-name``:
+        the table exists, the server starts, ``/api/health`` is fine, and only
+        writes blow up.
+
+        Idempotent - it only touches columns still reported as ``integer``, so
+        it is a single catalogue query on every subsequent boot.
+
+        SQLite needs nothing here: it stores all integers as 64-bit regardless
+        of the declared type name, which is exactly why this bug was invisible
+        in local development and in the test-suite.
+        """
+        if not self.postgres:
+            return
+
+        with self.tx() as conn:
+            narrow = {
+                (row[0], row[1])
+                for row in conn.execute(
+                    "SELECT table_name, column_name "
+                    "  FROM information_schema.columns "
+                    " WHERE table_schema = current_schema() "
+                    "   AND data_type = 'integer'"
+                ).fetchall()
+            }
+            for table, column in _BIGINT_COLUMNS:
+                if (table, column) in narrow:
+                    # Identifiers are literals from _BIGINT_COLUMNS, never user
+                    # input, so interpolation here cannot be injected into.
+                    conn.execute(
+                        f"ALTER TABLE {table} ALTER COLUMN {column} TYPE BIGINT"
+                    )
 
     def _migrate_password_column(self) -> None:
         """
@@ -718,16 +797,37 @@ class Database:
             params.append(int(since_ms))
 
         if best_per_player:
-            # `name` is grouped as well as `player_id`. SQLite tolerates a bare
-            # column alongside aggregates, but PostgreSQL rejects it outright.
-            # Names are denormalised per score row and kept in sync on rename,
-            # so grouping by both cannot split one player across two rows.
+            # One row per player: the player's single best run, with every
+            # column taken from that same row.
+            #
+            # The obvious GROUP BY formulation is wrong here. MAX(score) and
+            # MAX(distance) are independent aggregates, so they can be sourced
+            # from two different runs - a player whose best score came from a
+            # short run would be shown with the distance of some other, longer
+            # run. MIN(created_ms) has the same problem and additionally breaks
+            # the created_ms tie-break, since it reports the player's earliest
+            # run rather than the time of the run being ranked.
+            #
+            # ROW_NUMBER() picks one real row and keeps it intact. Supported by
+            # PostgreSQL and by SQLite 3.25+ (2018), comfortably below the
+            # version bundled with any supported Python.
+            #
+            # Partitioning on player_id alone - not (player_id, name) - means a
+            # rename that failed to propagate to historical score rows still
+            # collapses to a single leaderboard entry.
             sql = f"""
-                SELECT s.player_id, s.name, MAX(s.score) AS score,
-                       MAX(s.distance) AS distance, MIN(s.created_ms) AS created_ms
-                  FROM scores s
-                  {where}
-                 GROUP BY s.player_id, s.name
+                SELECT player_id, name, score, distance, created_ms
+                  FROM (
+                        SELECT s.player_id, s.name, s.score, s.distance,
+                               s.created_ms,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY s.player_id
+                                   ORDER BY s.score DESC, s.created_ms ASC
+                               ) AS rn
+                          FROM scores s
+                          {where}
+                       ) ranked
+                 WHERE rn = 1
                  ORDER BY score DESC, created_ms ASC
                  LIMIT ?
             """

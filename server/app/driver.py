@@ -84,9 +84,21 @@ _PRAGMA = re.compile(r"^\s*PRAGMA\b[^;]*;?\s*$", re.I | re.M)
 #: Detects the SQLite-only INSERT OR IGNORE form.
 _INSERT_OR_IGNORE = re.compile(r"\bINSERT\s+OR\s+IGNORE\s+INTO\b", re.I)
 
+#: Applied to PostgreSQL statements only. The shared dialect is SQLite-flavoured
+#: because that is the zero-dependency default; anything SQLite spells
+#: differently is rewritten here.
+#:
+#: Note on integer widths: the schema declares every millisecond timestamp and
+#: running total as BIGINT rather than INTEGER. SQLite stores all integers as
+#: 64-bit so the two are interchangeable there, but PostgreSQL INTEGER is int4
+#: (max 2_147_483_647), which cannot hold an epoch-millisecond value (~1.8e12).
+#: No rewrite is needed for that - BIGINT is valid in both - but the id columns
+#: below must become BIGSERIAL, not SERIAL, to match the BIGINT foreign keys
+#: that reference them.
 _REWRITES: tuple[tuple[re.Pattern[str], str], ...] = (
-    # Auto-incrementing primary keys.
-    (re.compile(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", re.I), "SERIAL PRIMARY KEY"),
+    # Auto-incrementing primary keys. Matches the exact phrase SQLite requires
+    # for a rowid alias, so only the id columns are affected.
+    (re.compile(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", re.I), "BIGSERIAL PRIMARY KEY"),
     # SQLite's REAL storage class -> the SQL-standard spelling.
     (re.compile(r"\bREAL\b", re.I), "DOUBLE PRECISION"),
     # No per-column collation clause; case-insensitivity is done with LOWER().

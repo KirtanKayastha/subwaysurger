@@ -158,7 +158,6 @@ def main(argv: list[str] | None = None) -> int:
     db_setting = args.db or _env_db()
 
     postgres = is_postgres_url(db_setting)
-    print(f"DEBUG run.py: db_setting = {db_setting}", file=sys.stderr)
 
     if postgres:
         # A connection URL, not a path: no file handling applies.
@@ -186,7 +185,10 @@ def main(argv: list[str] | None = None) -> int:
     if not config.WEB_DIR.is_dir():
         print(f"error: frontend directory missing: {config.WEB_DIR}", file=sys.stderr)
         return 1
-    print(f"DEBUG run.py: target = {target}", file=sys.stderr) 
+
+    # Log the backend, never the URL: a Postgres DATABASE_URL embeds the
+    # password, and platform logs are not a secret store.
+    print(f"  database  {'PostgreSQL' if postgres else target}")
 
     # Never pop a browser in a container: there is none, and the attempt is a
     # pointless startup delay.

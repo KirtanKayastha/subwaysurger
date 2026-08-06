@@ -12,9 +12,13 @@ bcrypt>=4.1.2
 
 # Loads a local .env during development. Ignored when not installed.
 python-dotenv>=1.0.1
-flask
-flask-cors
-bcrypt>=4.1.2
-pyjwt>=2.4.0
-python-dotenv>=1.0.1
+
+# PostgreSQL driver. Required whenever DATABASE_URL points at Postgres (Neon,
+# Render, Supabase...); without it the server refuses to start in that mode
+# rather than silently falling back to an ephemeral SQLite file.
 psycopg2-binary>=2.9.0
+
+# NOTE: flask, flask-cors and pyjwt were listed here but are imported nowhere.
+# The HTTP layer is http.server (server/app/server.py), auth is opaque bearer
+# tokens hashed into the players table (server/app/db.py), not JWT. They only
+# added install time and attack surface to the image.
