@@ -1,16 +1,21 @@
 """
-SQLite persistence layer.
+Persistence layer.
 
-The whole backend is stdlib-only, so this module wraps :mod:`sqlite3` with the
-few conveniences we actually need:
+Supports two backends behind one API (see :mod:`driver`):
+
+* **PostgreSQL** when ``DATABASE_URL`` names one - the deployed configuration.
+* **SQLite** otherwise - the zero-dependency default, and what the test-suite
+  uses via ``:memory:``.
+
+Structure worth knowing:
 
 * **Thread-local connections.** ``http.server``'s threading mixin handles each
-  request on its own thread, and SQLite connections are not shareable across
+  request on its own thread, and neither driver is safe to share across
   threads. Each thread lazily opens (and reuses) its own connection.
-* **WAL journaling.** Lets readers proceed while a writer commits, which keeps
-  leaderboard reads snappy during score submissions.
 * **A ``tx()`` context manager** for atomic multi-statement work such as
   "check balance, deduct coins, bump upgrade level".
+* **One SQL dialect at the call sites.** :mod:`driver` translates to
+  PostgreSQL where the two differ.
 
 All timestamps are epoch milliseconds (integers) for easy JSON transport.
 """
@@ -22,13 +27,13 @@ import hashlib
 import json
 import os
 import secrets
-import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
 from . import config
+from . import driver
 
 SCHEMA_VERSION = "2"
 
@@ -66,58 +71,63 @@ def new_public_id() -> str:
 
 
 class Database:
-    """A small, thread-safe facade over a single SQLite file."""
+    """A small, thread-safe facade over PostgreSQL or a single SQLite file."""
 
     def __init__(self, path: Optional[os.PathLike | str] = None) -> None:
-        self.path = Path(path) if path is not None else config.DEFAULT_DB_PATH
-        # ":memory:" is used by the test-suite; skip directory creation.
-        if str(self.path) != ":memory:":
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+        raw = str(path) if path is not None else None
+
+        #: True when the backend is PostgreSQL.
+        self.postgres = driver.is_postgres_url(raw)
+
+        if self.postgres:
+            # For PostgreSQL `target` is the connection URL, not a filesystem
+            # path, so no directory handling applies.
+            self.target = raw
+            self.path = None
+        else:
+            self.path = Path(raw) if raw else config.DEFAULT_DB_PATH
+            self.target = str(self.path)
+            # ":memory:" is used by the test-suite; skip directory creation.
+            if self.target != ":memory:":
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+
         self._local = threading.local()
-        # Serialises writes. SQLite can handle concurrent writers by retrying,
-        # but an explicit lock gives us clearer semantics for read-modify-write
-        # sequences like purchases.
+        # Serialises writes. Both backends can handle concurrent writers, but
+        # an explicit lock gives clearer semantics for the read-modify-write
+        # sequences used by purchases.
         self._write_lock = threading.RLock()
-        # An in-memory database only survives while a connection is open, so
-        # hold one open for the lifetime of the object in that mode.
-        self._keepalive: Optional[sqlite3.Connection] = None
-        if str(self.path) == ":memory:":
+        # An in-memory SQLite database only survives while a connection is
+        # open, so hold one open for the lifetime of the object in that mode.
+        self._keepalive: Optional[driver.Connection] = None
+        if not self.postgres and self.target == ":memory:":
             self._keepalive = self._new_connection()
         self.init_schema()
 
     # -- connection management ---------------------------------------------
 
-    def _new_connection(self) -> sqlite3.Connection:
-        # For in-memory databases every connection would otherwise get its own
-        # private database; a shared cache URI keeps them pointing at one.
-        if str(self.path) == ":memory:":
-            conn = sqlite3.connect(
-                "file:neonrush_test?mode=memory&cache=shared",
-                uri=True,
-                timeout=10.0,
-                check_same_thread=False,
-            )
-        else:
-            conn = sqlite3.connect(str(self.path), timeout=10.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 10000")
-        if str(self.path) != ":memory:":
-            conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        return conn
+    def _new_connection(self) -> driver.Connection:
+        return driver.connect(self.target, postgres=self.postgres)
 
     @property
-    def conn(self) -> sqlite3.Connection:
-        """The calling thread's connection, opened on first use."""
+    def conn(self) -> driver.Connection:
+        """
+        The calling thread's connection, opened on first use.
+
+        A cached connection is discarded and replaced if the server has closed
+        it. Hosted PostgreSQL drops idle connections, and a worker thread can
+        sit idle between requests for far longer than that timeout.
+        """
         conn = getattr(self._local, "conn", None)
+        if conn is not None and conn.stale:
+            conn.close()
+            conn = None
         if conn is None:
             conn = self._new_connection()
             self._local.conn = conn
         return conn
 
     @contextlib.contextmanager
-    def tx(self) -> Iterator[sqlite3.Connection]:
+    def tx(self) -> Iterator[driver.Connection]:
         """
         Run a block inside an exclusive transaction.
 
@@ -127,7 +137,7 @@ class Database:
         with self._write_lock:
             conn = self.conn
             try:
-                conn.execute("BEGIN IMMEDIATE")
+                conn.begin()
                 yield conn
             except BaseException:
                 conn.rollback()
@@ -169,8 +179,7 @@ class Database:
         out of their own progress.
         """
         with self.tx() as conn:
-            cols = {r["name"] for r in conn.execute("PRAGMA table_info(players)")}
-            if "password_hash" not in cols:
+            if "password_hash" not in conn.column_names("players"):
                 conn.execute(
                     "ALTER TABLE players ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''"
                 )
@@ -188,19 +197,15 @@ class Database:
         Idempotent: once the index exists this is a single cheap query.
         """
         with self.tx() as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type = 'index' AND name = 'idx_players_name_unique'"
-            ).fetchone()
-            if exists:
+            if conn.index_exists("idx_players_name_unique"):
                 return
 
             dupes = conn.execute(
                 """
-                SELECT LOWER(name) AS key, COUNT(*) AS n
+                SELECT LOWER(name) AS lname, COUNT(*) AS n
                   FROM players
                  GROUP BY LOWER(name)
-                HAVING n > 1
+                HAVING COUNT(*) > 1
                 """
             ).fetchall()
 
@@ -210,7 +215,7 @@ class Database:
                 rows = conn.execute(
                     "SELECT id, name FROM players WHERE LOWER(name) = ? "
                     "ORDER BY created_ms ASC, id ASC",
-                    (dupe["key"],),
+                    (dupe["lname"],),
                 ).fetchall()
                 for index, row in enumerate(rows[1:], start=2):
                     base = str(row["name"])
@@ -233,17 +238,27 @@ class Database:
                             )
                             break
 
-            conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_players_name_unique "
-                "ON players(name COLLATE NOCASE)"
-            )
+            # Case-insensitive uniqueness is expressed differently: SQLite uses
+            # a COLLATE NOCASE column, PostgreSQL an expression index. Both
+            # produce the same constraint, so the two spellings are explicit
+            # here rather than being run through the translator.
+            if self.postgres:
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_players_name_unique "
+                    "ON players (LOWER(name))"
+                )
+            else:
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_players_name_unique "
+                    "ON players(name COLLATE NOCASE)"
+                )
 
     # -- generic query helpers ---------------------------------------------
 
-    def query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+    def query(self, sql: str, params: Iterable[Any] = ()) -> list[Any]:
         return self.conn.execute(sql, tuple(params)).fetchall()
 
-    def query_one(self, sql: str, params: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
+    def query_one(self, sql: str, params: Iterable[Any] = ()) -> Optional[Any]:
         return self.conn.execute(sql, tuple(params)).fetchone()
 
     # ======================================================================
@@ -284,7 +299,7 @@ class Database:
             ).fetchone()
             if clash:
                 raise NameTakenError(name)
-            cur = conn.execute(
+            pid = conn.insert_id(
                 """
                 INSERT INTO players
                     (public_id, token_hash, name, password_hash, created_ms, updated_ms)
@@ -292,7 +307,6 @@ class Database:
                 """,
                 (new_public_id(), hash_token(token), name, password_hash, ts, ts),
             )
-            pid = cur.lastrowid
             # Everyone starts owning the default skin.
             conn.execute(
                 "INSERT OR IGNORE INTO skins(player_id, skin_id, created_ms) VALUES(?,?,?)",
@@ -397,7 +411,7 @@ class Database:
             )
 
     @staticmethod
-    def _player_dict(row: Optional[sqlite3.Row]) -> Optional[dict]:
+    def _player_dict(row: Optional[Any]) -> Optional[dict]:
         """Convert a ``players`` row into a JSON-friendly dict."""
         if row is None:
             return None
@@ -594,7 +608,7 @@ class Database:
             )
         return token
 
-    def take_run(self, token: str, player_id: int) -> Optional[sqlite3.Row]:
+    def take_run(self, token: str, player_id: int) -> Optional[Any]:
         """
         Atomically redeem a run token.
 
@@ -645,7 +659,7 @@ class Database:
                 return {"ok": False, "error": "no_player"}
 
             name = prow["name"]
-            conn.execute(
+            score_id = conn.insert_id(
                 """
                 INSERT INTO scores
                     (player_id, name, score, coins, distance, duration_ms,
@@ -655,14 +669,16 @@ class Database:
                 (player_id, name, int(score), int(coins), float(distance),
                  int(duration_ms), int(best_combo), ts),
             )
-            score_id = conn.execute("SELECT last_insert_rowid() AS i").fetchone()["i"]
 
             is_best = int(score) > int(prow["best_score"])
+            # GREATEST rather than MAX: in PostgreSQL MAX() is strictly an
+            # aggregate and the two-argument scalar form is a syntax error.
+            # SQLite has no GREATEST, so the driver rewrites it back to MAX().
             conn.execute(
                 """
                 UPDATE players
-                   SET best_score  = MAX(best_score, ?),
-                       best_distance = MAX(best_distance, ?),
+                   SET best_score  = GREATEST(best_score, ?),
+                       best_distance = GREATEST(best_distance, ?),
                        runs        = runs + 1,
                        play_ms     = play_ms + ?,
                        coins       = coins + ?,
@@ -702,12 +718,16 @@ class Database:
             params.append(int(since_ms))
 
         if best_per_player:
+            # `name` is grouped as well as `player_id`. SQLite tolerates a bare
+            # column alongside aggregates, but PostgreSQL rejects it outright.
+            # Names are denormalised per score row and kept in sync on rename,
+            # so grouping by both cannot split one player across two rows.
             sql = f"""
                 SELECT s.player_id, s.name, MAX(s.score) AS score,
                        MAX(s.distance) AS distance, MIN(s.created_ms) AS created_ms
                   FROM scores s
                   {where}
-                 GROUP BY s.player_id
+                 GROUP BY s.player_id, s.name
                  ORDER BY score DESC, created_ms ASC
                  LIMIT ?
             """
