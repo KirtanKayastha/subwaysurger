@@ -95,6 +95,10 @@ and score are each bounded by what is physically reachable. Implausible runs
 return `accepted: false` rather than an error - the player still sees their
 score, it just does not rank.
 
+**Dual-backend database.** SQLite is the default for local development. A
+PostgreSQL driver layer (`driver.py`) translates SQL dialect differences so
+the same code runs on Neon, Render, Supabase, or any standard Postgres host.
+
 **Offline-first.** Every read falls back to `localStorage`, every write updates
 local state before syncing. Losing the network mid-session (or opening the game
 with no server at all) degrades to local-only play with no lost progress.

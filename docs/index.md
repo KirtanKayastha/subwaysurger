@@ -157,13 +157,13 @@ Token rotation: every successful sign-in issues a fresh token and invalidates th
 
 ## Database
 
-### SQLite (default)
+### SQLite (default for local development)
 
 The server stores data in `data/neonrush.sqlite3` by default. WAL mode is enabled for concurrent reads during writes. The database file and its WAL sidecars are excluded from the Docker image via `.dockerignore`.
 
-### PostgreSQL
+### PostgreSQL / Neon (deployment)
 
-Set `DATABASE_URL=postgresql://...` or `postgres://...` to use PostgreSQL (Neon-ready). The server requires `psycopg2-binary` when running in Postgres mode; startup fails loudly if it is missing.
+Set `DATABASE_URL=postgresql://...` or `postgres://...` to use PostgreSQL. Neon, Render, Supabase, Heroku Postgres, and any standard Postgres host work. The server requires `psycopg2-binary` when running in Postgres mode; startup fails loudly if it is missing.
 
 The `server/app/driver.py` module provides a SQL dialect abstraction layer:
 
@@ -191,8 +191,8 @@ Environment variables and defaults:
 |---------------|----------------------------|--------------------------------------------------|
 | `PORT`        | `8000`                     | Bind port                                        |
 | `HOST`        | `127.0.0.1`                | Bind address; auto-binds `0.0.0.0` when `PORT` is set |
-| `DATABASE_URL`| `sqlite:///./data/neonrush.sqlite3` | Database target (PostgreSQL or SQLite URL, or bare path) |
-| `NEONRUSH_DB` | *(none)*                   | Explicit SQLite path, takes precedence over `DATABASE_URL` |
+| `DATABASE_URL`| `sqlite:///./data/neonrush.sqlite3` | Database target. Accepts PostgreSQL (`postgresql://` or `postgres://`), SQLite URLs (`sqlite:///path`), or bare filesystem paths |
+| `NEONRUSH_DB` | *(none)*                   | Explicit SQLite path; takes precedence over `DATABASE_URL` when set. Ignored for PostgreSQL URLs |
 
 All tuning constants live in `server/app/config.py`:
 
@@ -250,9 +250,9 @@ docker build -t neonrush .
 docker run -p 8080:8080 -v neonrush-data:/app/data neonrush
 ```
 
-The image is built on `python:3.11-slim` and runs as a non-root `neon` user. The `/app/data` volume preserves the database across container restarts.
+The image is built on `python:3.11-slim` and runs as a non-root `neon` user. The `/app/data` volume preserves the SQLite database across container restarts.
 
-Set `DATABASE_URL` to a PostgreSQL connection string when deploying to Neon:
+For PostgreSQL deployments (Neon, Render, Supabase, etc.):
 
 ```bash
 docker run -p 8080:8080 \
@@ -267,7 +267,7 @@ heroku create
 git push heroku main
 ```
 
-The `Procfile` declares `web: python run.py`. The server reads `$PORT` and binds `0.0.0.0` automatically.
+The `Procfile` declares `web: python run.py`. The server reads `$PORT` and binds `0.0.0.0` automatically. Set `DATABASE_URL` to the platform's provided PostgreSQL connection string (Heroku, Render, Fly.io, etc.).
 
 ---
 
