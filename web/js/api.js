@@ -89,14 +89,16 @@ function blankProfile() {
 
 export class ApiClient {
   constructor(baseUrl = '') {
-    this.baseUrl = baseUrl;
+    if (!baseUrl) {
+      const meta = document.querySelector('meta[name="api-base-url"]');
+      if (meta) baseUrl = (meta.getAttribute('content') || '').trim();
+    }
+    this.baseUrl = baseUrl.replace(/\/+$/, '');
     this.token = storage.get(STORAGE_KEYS.token, null);
     this.online = false;
     this._nextProbe = 0;
-    /** Cached catalogs (server-provided when online). */
     this.shop = OFFLINE_SHOP;
     this.skins = OFFLINE_SKINS;
-    /** Listeners for connectivity changes. */
     this.onStatusChange = null;
   }
 
