@@ -1,0 +1,620 @@
+"""
+SQLite persistence layer.
+
+The whole backend is stdlib-only, so this module wraps :mod:`sqlite3` with the
+few conveniences we actually need:
+
+* **Thread-local connections.** ``http.server``'s threading mixin handles each
+  request on its own thread, and SQLite connections are not shareable across
+  threads. Each thread lazily opens (and reuses) its own connection.
+* **WAL journaling.** Lets readers proceed while a writer commits, which keeps
+  leaderboard reads snappy during score submissions.
+* **A ``tx()`` context manager** for atomic multi-statement work such as
+  "check balance, deduct coins, bump upgrade level".
+
+All timestamps are epoch milliseconds (integers) for easy JSON transport.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import os
+import secrets
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Optional
+
+from . import config
+
+SCHEMA_VERSION = "1"
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+def now_ms() -> int:
+    """Current time as epoch milliseconds."""
+    return int(time.time() * 1000)
+
+
+def hash_token(token: str) -> str:
+    """Hash a bearer token for at-rest storage."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def new_token() -> str:
+    """Generate a fresh URL-safe bearer token."""
+    return secrets.token_urlsafe(config.TOKEN_BYTES)
+
+
+def new_public_id() -> str:
+    """Generate a short opaque public player id."""
+    return secrets.token_hex(8)
+
+
+class Database:
+    """A small, thread-safe facade over a single SQLite file."""
+
+    def __init__(self, path: Optional[os.PathLike | str] = None) -> None:
+        self.path = Path(path) if path is not None else config.DEFAULT_DB_PATH
+        # ":memory:" is used by the test-suite; skip directory creation.
+        if str(self.path) != ":memory:":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._local = threading.local()
+        # Serialises writes. SQLite can handle concurrent writers by retrying,
+        # but an explicit lock gives us clearer semantics for read-modify-write
+        # sequences like purchases.
+        self._write_lock = threading.RLock()
+        # An in-memory database only survives while a connection is open, so
+        # hold one open for the lifetime of the object in that mode.
+        self._keepalive: Optional[sqlite3.Connection] = None
+        if str(self.path) == ":memory:":
+            self._keepalive = self._new_connection()
+        self.init_schema()
+
+    # -- connection management ---------------------------------------------
+
+    def _new_connection(self) -> sqlite3.Connection:
+        # For in-memory databases every connection would otherwise get its own
+        # private database; a shared cache URI keeps them pointing at one.
+        if str(self.path) == ":memory:":
+            conn = sqlite3.connect(
+                "file:neonrush_test?mode=memory&cache=shared",
+                uri=True,
+                timeout=10.0,
+                check_same_thread=False,
+            )
+        else:
+            conn = sqlite3.connect(str(self.path), timeout=10.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 10000")
+        if str(self.path) != ":memory:":
+            conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        return conn
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """The calling thread's connection, opened on first use."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = self._new_connection()
+            self._local.conn = conn
+        return conn
+
+    @contextlib.contextmanager
+    def tx(self) -> Iterator[sqlite3.Connection]:
+        """
+        Run a block inside an exclusive transaction.
+
+        Commits on success, rolls back on any exception. Held under
+        ``_write_lock`` so read-modify-write logic is race-free.
+        """
+        with self._write_lock:
+            conn = self.conn
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn
+            except BaseException:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+
+    def close(self) -> None:
+        """Close this thread's connection (and the in-memory keepalive)."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
+        if self._keepalive is not None:
+            self._keepalive.close()
+            self._keepalive = None
+
+    # -- schema -------------------------------------------------------------
+
+    def init_schema(self) -> None:
+        """Create tables if absent and stamp the schema version."""
+        sql = (Path(__file__).with_name("schema.sql")).read_text(encoding="utf-8")
+        with self.tx() as conn:
+            conn.executescript(sql)
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (SCHEMA_VERSION,),
+            )
+
+    # -- generic query helpers ---------------------------------------------
+
+    def query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+        return self.conn.execute(sql, tuple(params)).fetchall()
+
+    def query_one(self, sql: str, params: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
+        return self.conn.execute(sql, tuple(params)).fetchone()
+
+    # ======================================================================
+    # Players
+    # ======================================================================
+
+    def create_player(self, name: str) -> tuple[dict, str]:
+        """
+        Register a new player.
+
+        Returns ``(player_dict, raw_token)``. The raw token is shown to the
+        caller exactly once; only its hash is persisted.
+        """
+        token = new_token()
+        ts = now_ms()
+        with self.tx() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO players
+                    (public_id, token_hash, name, created_ms, updated_ms)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (new_public_id(), hash_token(token), name, ts, ts),
+            )
+            pid = cur.lastrowid
+            # Everyone starts owning the default skin.
+            conn.execute(
+                "INSERT OR IGNORE INTO skins(player_id, skin_id, created_ms) VALUES(?,?,?)",
+                (pid, "cyan", ts),
+            )
+            row = conn.execute("SELECT * FROM players WHERE id = ?", (pid,)).fetchone()
+        return self._player_dict(row), token
+
+    def player_by_token(self, token: str) -> Optional[dict]:
+        """Look up a player by raw bearer token, or ``None``."""
+        if not token:
+            return None
+        row = self.query_one(
+            "SELECT * FROM players WHERE token_hash = ?", (hash_token(token),)
+        )
+        return self._player_dict(row) if row else None
+
+    def player_by_id(self, player_id: int) -> Optional[dict]:
+        row = self.query_one("SELECT * FROM players WHERE id = ?", (player_id,))
+        return self._player_dict(row) if row else None
+
+    def rename_player(self, player_id: int, name: str) -> None:
+        """Update a display name (also backfills historical score rows)."""
+        with self.tx() as conn:
+            conn.execute(
+                "UPDATE players SET name = ?, updated_ms = ? WHERE id = ?",
+                (name, now_ms(), player_id),
+            )
+            # Keep the denormalised leaderboard name in sync.
+            conn.execute("UPDATE scores SET name = ? WHERE player_id = ?", (name, player_id))
+
+    def set_skin(self, player_id: int, skin_id: str) -> bool:
+        """Equip an owned skin. Returns False if the player does not own it."""
+        owned = self.query_one(
+            "SELECT 1 FROM skins WHERE player_id = ? AND skin_id = ?", (player_id, skin_id)
+        )
+        if not owned:
+            return False
+        with self.tx() as conn:
+            conn.execute(
+                "UPDATE players SET skin = ?, updated_ms = ? WHERE id = ?",
+                (skin_id, now_ms(), player_id),
+            )
+        return True
+
+    def save_progress(self, player_id: int, blob: dict) -> None:
+        """Persist the opaque client-side progress blob (missions, stats...)."""
+        text = json.dumps(blob, separators=(",", ":"))[: config.MAX_PROGRESS_BYTES]
+        with self.tx() as conn:
+            conn.execute(
+                "UPDATE players SET progress = ?, updated_ms = ? WHERE id = ?",
+                (text, now_ms(), player_id),
+            )
+
+    @staticmethod
+    def _player_dict(row: Optional[sqlite3.Row]) -> Optional[dict]:
+        """Convert a ``players`` row into a JSON-friendly dict."""
+        if row is None:
+            return None
+        try:
+            progress = json.loads(row["progress"]) if row["progress"] else {}
+        except (ValueError, TypeError):
+            progress = {}
+        return {
+            "id": row["id"],
+            "publicId": row["public_id"],
+            "name": row["name"],
+            "coins": row["coins"],
+            "totalCoins": row["total_coins"],
+            "bestScore": row["best_score"],
+            "bestDistance": row["best_distance"],
+            "runs": row["runs"],
+            "playMs": row["play_ms"],
+            "skin": row["skin"],
+            "progress": progress,
+            "createdMs": row["created_ms"],
+        }
+
+    # ======================================================================
+    # Upgrades & skins
+    # ======================================================================
+
+    def upgrades_for(self, player_id: int) -> dict[str, int]:
+        rows = self.query(
+            "SELECT item_id, level FROM upgrades WHERE player_id = ?", (player_id,)
+        )
+        return {r["item_id"]: r["level"] for r in rows}
+
+    def skins_for(self, player_id: int) -> list[str]:
+        rows = self.query(
+            "SELECT skin_id FROM skins WHERE player_id = ? ORDER BY created_ms", (player_id,)
+        )
+        return [r["skin_id"] for r in rows]
+
+    def add_coins(self, player_id: int, amount: int) -> int:
+        """Credit coins (also bumping the lifetime counter). Returns balance."""
+        amount = max(0, int(amount))
+        with self.tx() as conn:
+            conn.execute(
+                """
+                UPDATE players
+                   SET coins = coins + ?, total_coins = total_coins + ?, updated_ms = ?
+                 WHERE id = ?
+                """,
+                (amount, amount, now_ms(), player_id),
+            )
+            row = conn.execute("SELECT coins FROM players WHERE id = ?", (player_id,)).fetchone()
+        return int(row["coins"]) if row else 0
+
+    def purchase(self, player_id: int, item_id: str) -> dict:
+        """
+        Attempt to buy the next tier of ``item_id``.
+
+        Price and level caps come from :data:`config.SHOP_CATALOG`, never from
+        the client. The balance check and level bump share one transaction so
+        concurrent requests cannot double-spend.
+
+        Returns ``{"ok": True, "level":..., "coins":..., "spent":...}`` or
+        ``{"ok": False, "error": "<reason>"}``.
+        """
+        catalog = config.shop_index()
+        item = catalog.get(item_id)
+        if item is None:
+            return {"ok": False, "error": "unknown_item"}
+
+        with self.tx() as conn:
+            prow = conn.execute(
+                "SELECT coins FROM players WHERE id = ?", (player_id,)
+            ).fetchone()
+            if prow is None:
+                return {"ok": False, "error": "no_player"}
+            balance = int(prow["coins"])
+
+            lrow = conn.execute(
+                "SELECT level FROM upgrades WHERE player_id = ? AND item_id = ?",
+                (player_id, item_id),
+            ).fetchone()
+            level = int(lrow["level"]) if lrow else 0
+
+            is_consumable = item["levels"] == 0
+            if is_consumable:
+                if level >= int(item.get("max_stock", 9)):
+                    return {"ok": False, "error": "stock_full"}
+            elif level >= item["levels"]:
+                return {"ok": False, "error": "max_level"}
+
+            price = config.price_for(item, level)
+            if balance < price:
+                return {"ok": False, "error": "insufficient_coins", "price": price}
+
+            ts = now_ms()
+            conn.execute(
+                "UPDATE players SET coins = coins - ?, updated_ms = ? WHERE id = ?",
+                (price, ts, player_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO upgrades(player_id, item_id, level, updated_ms)
+                VALUES(?,?,?,?)
+                ON CONFLICT(player_id, item_id)
+                DO UPDATE SET level = level + 1, updated_ms = excluded.updated_ms
+                """,
+                (player_id, item_id, 1, ts),
+            )
+            new_level = level + 1
+            new_balance = balance - price
+
+        return {"ok": True, "itemId": item_id, "level": new_level,
+                "coins": new_balance, "spent": price}
+
+    def buy_skin(self, player_id: int, skin_id: str) -> dict:
+        """Purchase a cosmetic skin (one-time unlock) and equip it."""
+        skins = config.skin_index()
+        skin = skins.get(skin_id)
+        if skin is None:
+            return {"ok": False, "error": "unknown_skin"}
+
+        with self.tx() as conn:
+            owned = conn.execute(
+                "SELECT 1 FROM skins WHERE player_id = ? AND skin_id = ?",
+                (player_id, skin_id),
+            ).fetchone()
+            if owned:
+                conn.execute(
+                    "UPDATE players SET skin = ?, updated_ms = ? WHERE id = ?",
+                    (skin_id, now_ms(), player_id),
+                )
+                row = conn.execute(
+                    "SELECT coins FROM players WHERE id = ?", (player_id,)
+                ).fetchone()
+                return {"ok": True, "skinId": skin_id, "coins": int(row["coins"]),
+                        "spent": 0, "equipped": True}
+
+            prow = conn.execute(
+                "SELECT coins FROM players WHERE id = ?", (player_id,)
+            ).fetchone()
+            if prow is None:
+                return {"ok": False, "error": "no_player"}
+            balance = int(prow["coins"])
+            price = int(skin["price"])
+            if balance < price:
+                return {"ok": False, "error": "insufficient_coins", "price": price}
+
+            ts = now_ms()
+            conn.execute(
+                "UPDATE players SET coins = coins - ?, skin = ?, updated_ms = ? WHERE id = ?",
+                (price, skin_id, ts, player_id),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO skins(player_id, skin_id, created_ms) VALUES(?,?,?)",
+                (player_id, skin_id, ts),
+            )
+            new_balance = balance - price
+
+        return {"ok": True, "skinId": skin_id, "coins": new_balance,
+                "spent": price, "equipped": True}
+
+    def consume_upgrade(self, player_id: int, item_id: str, count: int = 1) -> int:
+        """
+        Spend ``count`` units of a consumable (e.g. a hoverboard).
+
+        Returns the remaining stock; never drops below zero.
+        """
+        with self.tx() as conn:
+            row = conn.execute(
+                "SELECT level FROM upgrades WHERE player_id = ? AND item_id = ?",
+                (player_id, item_id),
+            ).fetchone()
+            have = int(row["level"]) if row else 0
+            left = max(0, have - max(0, int(count)))
+            if row:
+                conn.execute(
+                    "UPDATE upgrades SET level = ?, updated_ms = ? "
+                    "WHERE player_id = ? AND item_id = ?",
+                    (left, now_ms(), player_id, item_id),
+                )
+        return left
+
+    # ======================================================================
+    # Run sessions
+    # ======================================================================
+
+    def start_run(self, player_id: int, seed: int) -> str:
+        """Issue a single-use run token and record its start time."""
+        token = secrets.token_urlsafe(18)
+        with self.tx() as conn:
+            conn.execute(
+                "INSERT INTO runs(token, player_id, started_ms, seed) VALUES(?,?,?,?)",
+                (token, player_id, now_ms(), int(seed)),
+            )
+        return token
+
+    def take_run(self, token: str, player_id: int) -> Optional[sqlite3.Row]:
+        """
+        Atomically redeem a run token.
+
+        Returns the row if the token exists, belongs to ``player_id``, and has
+        not been redeemed before; otherwise ``None``.
+        """
+        with self.tx() as conn:
+            row = conn.execute(
+                "SELECT * FROM runs WHERE token = ? AND player_id = ?", (token, player_id)
+            ).fetchone()
+            if row is None or row["used_ms"] is not None:
+                return None
+            conn.execute("UPDATE runs SET used_ms = ? WHERE token = ?", (now_ms(), token))
+            return row
+
+    def prune_runs(self) -> int:
+        """Delete stale run tokens. Returns the number removed."""
+        cutoff = now_ms() - config.RUN_TOKEN_PRUNE_SEC * 1000
+        with self.tx() as conn:
+            cur = conn.execute("DELETE FROM runs WHERE started_ms < ?", (cutoff,))
+        return cur.rowcount or 0
+
+    # ======================================================================
+    # Scores & leaderboard
+    # ======================================================================
+
+    def record_score(
+        self,
+        player_id: int,
+        *,
+        score: int,
+        coins: int,
+        distance: float,
+        duration_ms: int,
+        best_combo: int,
+        coins_banked: int,
+    ) -> dict:
+        """
+        Append a run result and roll the player's aggregate stats forward.
+
+        Returns a summary including whether this run set a personal best and
+        the player's new coin balance.
+        """
+        ts = now_ms()
+        with self.tx() as conn:
+            prow = conn.execute("SELECT * FROM players WHERE id = ?", (player_id,)).fetchone()
+            if prow is None:
+                return {"ok": False, "error": "no_player"}
+
+            name = prow["name"]
+            conn.execute(
+                """
+                INSERT INTO scores
+                    (player_id, name, score, coins, distance, duration_ms,
+                     best_combo, created_ms)
+                VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (player_id, name, int(score), int(coins), float(distance),
+                 int(duration_ms), int(best_combo), ts),
+            )
+            score_id = conn.execute("SELECT last_insert_rowid() AS i").fetchone()["i"]
+
+            is_best = int(score) > int(prow["best_score"])
+            conn.execute(
+                """
+                UPDATE players
+                   SET best_score  = MAX(best_score, ?),
+                       best_distance = MAX(best_distance, ?),
+                       runs        = runs + 1,
+                       play_ms     = play_ms + ?,
+                       coins       = coins + ?,
+                       total_coins = total_coins + ?,
+                       updated_ms  = ?
+                 WHERE id = ?
+                """,
+                (int(score), float(distance), int(duration_ms),
+                 int(coins_banked), int(coins_banked), ts, player_id),
+            )
+            after = conn.execute("SELECT * FROM players WHERE id = ?", (player_id,)).fetchone()
+
+        return {
+            "ok": True,
+            "scoreId": score_id,
+            "personalBest": is_best,
+            "coins": int(after["coins"]),
+            "bestScore": int(after["best_score"]),
+            "runs": int(after["runs"]),
+            "coinsBanked": int(coins_banked),
+        }
+
+    def leaderboard(self, limit: int = 20, *, since_ms: Optional[int] = None,
+                    best_per_player: bool = True) -> list[dict]:
+        """
+        Top runs, optionally limited to a time window.
+
+        With ``best_per_player`` (the default) each player appears once with
+        their single best run, which reads better than one person filling the
+        whole board.
+        """
+        limit = max(1, min(int(limit), 100))
+        params: list[Any] = []
+        where = ""
+        if since_ms is not None:
+            where = "WHERE created_ms >= ?"
+            params.append(int(since_ms))
+
+        if best_per_player:
+            sql = f"""
+                SELECT s.player_id, s.name, MAX(s.score) AS score,
+                       MAX(s.distance) AS distance, MIN(s.created_ms) AS created_ms
+                  FROM scores s
+                  {where}
+                 GROUP BY s.player_id
+                 ORDER BY score DESC, created_ms ASC
+                 LIMIT ?
+            """
+        else:
+            sql = f"""
+                SELECT s.player_id, s.name, s.score, s.distance, s.created_ms
+                  FROM scores s
+                  {where}
+                 ORDER BY s.score DESC, s.created_ms ASC
+                 LIMIT ?
+            """
+        params.append(limit)
+        rows = self.query(sql, params)
+        return [
+            {
+                "rank": i + 1,
+                "name": r["name"],
+                "score": int(r["score"]),
+                "distance": float(r["distance"]),
+                "playerId": r["player_id"],
+                "createdMs": int(r["created_ms"]),
+            }
+            for i, r in enumerate(rows)
+        ]
+
+    def player_rank(self, player_id: int) -> Optional[int]:
+        """1-based rank of a player's best score on the all-time board."""
+        row = self.query_one("SELECT best_score FROM players WHERE id = ?", (player_id,))
+        if row is None or not row["best_score"]:
+            return None
+        best = int(row["best_score"])
+        ahead = self.query_one(
+            "SELECT COUNT(*) AS c FROM players WHERE best_score > ?", (best,)
+        )
+        return int(ahead["c"]) + 1 if ahead else None
+
+    def recent_scores(self, player_id: int, limit: int = 10) -> list[dict]:
+        """A player's most recent runs, newest first."""
+        rows = self.query(
+            """
+            SELECT score, coins, distance, duration_ms, best_combo, created_ms
+              FROM scores WHERE player_id = ?
+             ORDER BY created_ms DESC LIMIT ?
+            """,
+            (player_id, max(1, min(int(limit), 50))),
+        )
+        return [
+            {
+                "score": int(r["score"]),
+                "coins": int(r["coins"]),
+                "distance": float(r["distance"]),
+                "durationMs": int(r["duration_ms"]),
+                "bestCombo": int(r["best_combo"]),
+                "createdMs": int(r["created_ms"]),
+            }
+            for r in rows
+        ]
+
+    def stats(self) -> dict:
+        """Global counters for the info panel."""
+        row = self.query_one(
+            "SELECT COUNT(*) AS runs, COALESCE(SUM(distance),0) AS dist,"
+            " COALESCE(SUM(coins),0) AS coins FROM scores"
+        )
+        players = self.query_one("SELECT COUNT(*) AS c FROM players")
+        return {
+            "totalRuns": int(row["runs"]) if row else 0,
+            "totalDistance": float(row["dist"]) if row else 0.0,
+            "totalCoins": int(row["coins"]) if row else 0,
+            "players": int(players["c"]) if players else 0,
+        }

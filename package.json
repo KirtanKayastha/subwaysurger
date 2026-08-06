@@ -1,0 +1,15 @@
+{
+  "devDependencies": {
+    "playwright": "^1.49.1"
+  },
+  "name": "neon-rush",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Dev tooling only. The game itself has no runtime npm dependencies.",
+  "scripts": {
+    "check": "node tools/check_js.mjs",
+    "simulate": "node tools/simulate.mjs 12 6000",
+    "smoke": "node tools/smoke.mjs"
+  }
+}

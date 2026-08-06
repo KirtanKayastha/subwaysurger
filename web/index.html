@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>NEON RUSH - endless runner</title>
+
+<!--
+  Viewport is locked down for a game: no user zoom, and viewport-fit=cover so
+  the canvas can extend under iPhone notches. `interactive-widget` stops the
+  mobile keyboard from resizing the canvas when the name field is focused.
+-->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
+<meta name="theme-color" content="#05060f" />
+<meta name="color-scheme" content="dark" />
+<meta name="description" content="NEON RUSH - a neon-drenched endless subway runner." />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+<!-- Inline SVG favicon: keeps the app free of external asset requests. -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230a0d1f'/><path d='M8 24V8l7 9V8h4v16h-4l-7-9v9z' fill='%2322e8ff'/></svg>" />
+
+<link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+  <!--
+    Layer order (bottom to top):
+      #game    - the WebGL-free 2D canvas the engine renders into
+      #ui-root - React-managed overlay: menus, HUD, shop, leaderboard
+    The canvas never re-mounts, so React state changes can never interrupt
+    the render loop.
+  -->
+  <div id="stage">
+    <canvas id="game" aria-label="Game viewport" role="img"></canvas>
+    <div id="ui-root"></div>
+  </div>
+
+  <!-- Shown only if the browser is too old to run the module bundle. -->
+  <noscript>
+    <div class="fallback">
+      <h1>NEON RUSH</h1>
+      <p>This game needs JavaScript enabled.</p>
+    </div>
+  </noscript>
+
+  <!-- Vendored React (no CDN at runtime, so the game works fully offline). -->
+  <script src="/vendor/react.production.min.js"></script>
+  <script src="/vendor/react-dom.production.min.js"></script>
+
+  <!-- Entry point. ES modules => deferred + strict mode by default. -->
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>
